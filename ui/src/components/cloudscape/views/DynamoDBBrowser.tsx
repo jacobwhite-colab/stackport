@@ -356,12 +356,13 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
             id: 'actions',
             header: '',
             width: 140,
+            minWidth: 140,
             cell: (item: DynamoDBItem) => (
               <SpaceBetween direction="horizontal" size="xs">
-                <Button variant="inline-link" onClick={() => setEditor({ mode: 'edit', item: item as Record<string, unknown>, format: 'dynamodb' })}>
+                <Button variant="inline-link" wrapText={false} onClick={() => setEditor({ mode: 'edit', item: item as Record<string, unknown>, format: 'dynamodb' })}>
                   Edit
                 </Button>
-                <Button variant="inline-link" onClick={() => deleteOne(item)}>
+                <Button variant="inline-link" wrapText={false} onClick={() => deleteOne(item)}>
                   Delete
                 </Button>
               </SpaceBetween>
