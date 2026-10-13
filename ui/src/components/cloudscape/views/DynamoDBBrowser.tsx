@@ -27,7 +27,6 @@ import { LEARN_HOTSPOTS } from '@/components/cloudscape/learn/hotspots'
 import {
   batchWriteDynamoDBItems,
   createDynamoDBTable,
-  deleteDynamoDBItem,
   fetchDynamoDBItems,
   fetchDynamoDBTable,
   fetchDynamoDBTables,
@@ -258,18 +257,6 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
     }
   }
 
-  const deleteOne = async (item: DynamoDBItem) => {
-    try {
-      const key = extractKeyDynamo(item, detail.partition_key ?? '', detail.sort_key)
-      await deleteDynamoDBItem(detail.name, key, 'dynamodb', activeEndpoint)
-      toast.success('Item deleted')
-      if (mode === 'scan') scan()
-      else runQuery()
-    } catch (err) {
-      toast.error(`Failed to delete item: ${err}`)
-    }
-  }
-
   return (
     <SpaceBetween size="m">
       <SpaceBetween direction="horizontal" size="s">
@@ -351,30 +338,25 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
           </Header>
         }
         empty={<Box textAlign="center">No items</Box>}
-        columnDefinitions={[
-          ...columns.map((key) => ({
-            id: key,
-            header: key,
-            width: 180,
-            cell: (item: DynamoDBItem) => formatAttribute(dynamoItemToPlainMap(item)[key]),
-          })),
-          {
-            id: 'actions',
-            header: <span className="sr-only">Actions</span>,
-            width: 140,
-            minWidth: 140,
-            cell: (item: DynamoDBItem) => (
-              <SpaceBetween direction="horizontal" size="xs">
-                <Button variant="inline-link" wrapText={false} onClick={() => setEditor({ mode: 'edit', item: item as Record<string, unknown>, format: 'dynamodb' })}>
-                  Edit
-                </Button>
-                <Button variant="inline-link" wrapText={false} onClick={() => deleteOne(item)}>
-                  Delete
-                </Button>
-              </SpaceBetween>
-            ),
+        columnDefinitions={columns.map((key) => ({
+          id: key,
+          header: key,
+          width: 180,
+          cell: (item: DynamoDBItem) => {
+            const value = formatAttribute(dynamoItemToPlainMap(item)[key])
+            return key === detail.partition_key ? (
+              <Button
+                variant="inline-link"
+                wrapText={false}
+                className="max-w-full truncate"
+                ariaLabel={`Edit item with ${key}: ${value}`}
+                onClick={() => setEditor({ mode: 'edit', item: item as Record<string, unknown>, format: 'dynamodb' })}
+              >
+                {value}
+              </Button>
+            ) : value
           },
-        ]}
+        }))}
         footer={
           mode === 'scan' && nextToken ? (
             <Box textAlign="center">

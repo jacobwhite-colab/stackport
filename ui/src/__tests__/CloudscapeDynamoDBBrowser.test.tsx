@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 
 vi.mock('@/hooks/useEndpoint', () => ({
@@ -83,16 +83,16 @@ const queryPayload = {
 
 let fetchMock: ReturnType<typeof vi.fn>
 
-function mockFetchByUrl() {
+function mockFetchByUrl(overrides: { tableDetail?: unknown; scanPayload?: unknown } = {}) {
   fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? 'GET'
     let payload: unknown = statsPayload
     if (url.includes('/items/batch')) payload = { ok: true, table: 'learners' }
     else if (url.includes('/query')) payload = queryPayload
-    else if (url.includes('/items')) payload = method === 'GET' ? scanPayload : { ok: true, table: 'learners' }
+    else if (url.includes('/items')) payload = method === 'GET' ? overrides.scanPayload ?? scanPayload : { ok: true, table: 'learners' }
     else if (url.includes('/tags')) payload = { tags: {} }
-    else if (url.includes('/api/dynamodb/tables/learners')) payload = tableDetail
+    else if (url.includes('/api/dynamodb/tables/learners')) payload = overrides.tableDetail ?? tableDetail
     else if (url.includes('/api/dynamodb/tables')) payload = tablesPayload
     else if (url.includes('/api/stats')) payload = statsPayload
     return Promise.resolve({ ok: true, json: () => Promise.resolve(payload) } as Response)
@@ -129,6 +129,48 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(await screen.findByText('id (S)')).toBeInTheDocument()
     expect(await screen.findByText('Ada')).toBeInTheDocument()
     expect(await screen.findByText('Grace')).toBeInTheDocument()
+  })
+
+  it('uses partition key values for editing and keeps deletion in the selection toolbar', async () => {
+    renderDynamo('/resources/dynamodb?table=learners')
+    const row = (await screen.findByText('Ada')).closest('tr')!
+    expect(within(row).getByRole('button', { name: 'Edit item with id: 1' })).toHaveTextContent('1')
+    expect(within(row).queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
+
+    fireEvent.click(within(row).getByRole('checkbox'))
+    expect(screen.getByRole('button', { name: 'Delete selected (1)' })).toBeEnabled()
+  })
+
+  it('edits and batch-deletes the correct item when rows share a partition key', async () => {
+    mockFetchByUrl({
+      tableDetail: { ...tableDetail, sort_key: 'revision', sort_key_type: 'N' },
+      scanPayload: {
+        ...scanPayload,
+        items: [
+          { id: { S: 'shared' }, revision: { N: '1' }, name: { S: 'Ada' } },
+          { id: { S: 'shared' }, revision: { N: '2' }, name: { S: 'Grace' } },
+        ],
+      },
+    })
+    renderDynamo('/resources/dynamodb?table=learners')
+    const row = (await screen.findByText('Grace')).closest('tr')!
+    fireEvent.click(within(row).getByRole('button', { name: 'Edit item with id: shared' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Edit item' })
+    const textarea = within(dialog).getByRole('textbox') as HTMLTextAreaElement
+    expect(JSON.parse(textarea.value)).toEqual({ id: 'shared', revision: 2, name: 'Grace' })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(within(row).getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete selected (1)' }))
+    await waitFor(() => {
+      const batchCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/items/batch'))
+      expect(batchCall).toBeTruthy()
+      const body = JSON.parse((batchCall![1] as RequestInit).body as string)
+      expect(body.operations).toEqual([{ op: 'delete', key: { id: { S: 'shared' }, revision: { N: '2' } } }])
+    })
   })
 
   it('runs a query with the typed partition key', async () => {
@@ -191,7 +233,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     renderDynamo()
     fireEvent.click(await screen.findByRole('link', { name: 'learners' }))
     await screen.findByText('Ada')
-    fireEvent.click(screen.getAllByText('Edit')[0])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 1' }))
 
     const getTextarea = () =>
       screen.getAllByRole('textbox').find((el) => el.tagName === 'TEXTAREA') as HTMLTextAreaElement
@@ -215,7 +257,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     renderDynamo()
     fireEvent.click(await screen.findByRole('link', { name: 'learners' }))
     await screen.findByText('Ada')
-    fireEvent.click(screen.getAllByText('Edit')[1])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 2' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Save item' }))
 
     await waitFor(() => {
