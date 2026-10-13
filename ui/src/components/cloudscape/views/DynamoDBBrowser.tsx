@@ -321,6 +321,11 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         items={items}
         trackBy={(item) => JSON.stringify(item)}
         variant="embedded"
+        resizableColumns
+        ariaLabels={{
+          resizerRoleDescription: 'Column resize handle',
+          resizerTooltipText: 'Drag to resize, or press Enter and use the arrow keys',
+        }}
         loading={loading && items.length === 0}
         loadingText="Loading items"
         selectionType="multi"
@@ -354,7 +359,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
           })),
           {
             id: 'actions',
-            header: '',
+            header: <span className="sr-only">Actions</span>,
             width: 140,
             minWidth: 140,
             cell: (item: DynamoDBItem) => (
