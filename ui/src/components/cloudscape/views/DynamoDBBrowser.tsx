@@ -355,6 +355,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
           ...columns.map((key) => ({
             id: key,
             header: key,
+            width: 180,
             cell: (item: DynamoDBItem) => formatAttribute(dynamoItemToPlainMap(item)[key]),
           })),
           {
