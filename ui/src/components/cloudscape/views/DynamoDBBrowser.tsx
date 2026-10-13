@@ -37,8 +37,10 @@ import {
 } from '@/lib/api'
 import type { DynamoDBItem, DynamoDBTable, DynamoDBTableDetail } from '@/lib/types'
 import { dynamoItemToPlainMap, extractKeyDynamo, plainItemToDynamoMap } from '@/lib/dynamodb-marshal'
+import { filterDynamoDBItems, isItemFilterActive, type DynamoDBItemFilter, type ItemFilterMatchMode } from '@/lib/dynamodb-item-filters'
 import { useEndpoint } from '@/hooks/useEndpoint'
 import { useFetch } from '@/hooks/useFetch'
+import { DynamoDBItemFilters } from './DynamoDBItemFilters'
 
 const SORT_OPERATORS = ['=', '<', '<=', '>', '>=', 'BEGINS_WITH'].map((op) => ({ value: op, label: op }))
 const PAGE_SIZES = [25, 50, 100].map((n) => ({ value: String(n), label: `${n} items` }))
@@ -181,6 +183,14 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   const [selected, setSelected] = useState<DynamoDBItem[]>([])
   const [editor, setEditor] = useState<{ mode: 'create' | 'edit'; item: Record<string, unknown>; format: 'plain' | 'dynamodb' } | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [filters, setFilters] = useState<DynamoDBItemFilter[]>([])
+  const [filterMatchMode, setFilterMatchMode] = useState<ItemFilterMatchMode>('all')
+  const [filterCaseSensitive, setFilterCaseSensitive] = useState(false)
+  const visibleItems = useMemo(
+    () => filterDynamoDBItems(items, filters, filterMatchMode, filterCaseSensitive),
+    [items, filters, filterMatchMode, filterCaseSensitive],
+  )
+  const filtersActive = filters.some(isItemFilterActive)
 
   const scan = useCallback(
     async (append = false, token?: string | null) => {
@@ -230,13 +240,14 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
     if (mode === 'scan') scan()
   }, [mode, scan])
 
-  const columns = useMemo(() => {
+  const allColumns = useMemo(() => {
     const keys = new Set<string>()
     if (detail.partition_key) keys.add(detail.partition_key)
     if (detail.sort_key) keys.add(detail.sort_key)
     for (const item of items) for (const k of Object.keys(item)) keys.add(k)
-    return [...keys].slice(0, 8)
+    return [...keys]
   }, [items, detail])
+  const columns = useMemo(() => allColumns.slice(0, 8), [allColumns])
 
   const deleteSelected = async () => {
     setDeleting(true)
@@ -304,8 +315,18 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         </SpaceBetween>
       )}
 
+      <DynamoDBItemFilters
+        columns={allColumns}
+        filters={filters}
+        matchMode={filterMatchMode}
+        caseSensitive={filterCaseSensitive}
+        onChange={(next) => { setFilters(next); setSelected([]) }}
+        onMatchModeChange={(next) => { setFilterMatchMode(next); setSelected([]) }}
+        onCaseSensitiveChange={(next) => { setFilterCaseSensitive(next); setSelected([]) }}
+      />
+
       <Table
-        items={items}
+        items={visibleItems}
         trackBy={(item) => JSON.stringify(item)}
         variant="embedded"
         resizableColumns
@@ -321,7 +342,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         header={
           <Header
             variant="h3"
-            counter={`(${items.length})`}
+            counter={filtersActive ? `(${visibleItems.length} of ${items.length} loaded)` : `(${items.length})`}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button iconName="refresh" onClick={() => (mode === 'scan' ? scan() : runQuery())} loading={loading} ariaLabel="Reload items" />
@@ -337,7 +358,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
             Items
           </Header>
         }
-        empty={<Box textAlign="center">No items</Box>}
+        empty={<Box textAlign="center">{filtersActive && items.length > 0 ? 'No items match these filters' : 'No items'}</Box>}
         columnDefinitions={columns.map((key) => ({
           id: key,
           header: key,
