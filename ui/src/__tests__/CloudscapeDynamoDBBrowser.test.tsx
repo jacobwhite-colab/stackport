@@ -80,6 +80,7 @@ const queryPayload = {
   items: [{ id: { S: '1' }, name: { S: 'Ada' }, score: { N: '95' } }],
   count: 1,
   scanned_count: 1,
+  next_token: null,
 }
 
 type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
@@ -314,7 +315,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fillFilter(1, 'name', 'ADA')
     expect(screen.getByText('Ada')).toBeInTheDocument()
     expect(screen.queryByText('Grace')).not.toBeInTheDocument()
-    expect(screen.getByText('(1 of 2 loaded)')).toBeInTheDocument()
+    expect(screen.getByText('(1 of 2 on this page)')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Match case' }))
     expect(screen.getByText('No items match these filters')).toBeInTheDocument()
@@ -359,14 +360,14 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(screen.getByText('Query'))
     fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '2' } })
     fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
-    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/query'))).toBe(true))
+    await screen.findByRole('button', { name: 'Edit item with id: 2' })
     expect(screen.queryByText('Ada')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 2' }))
     const dialog = await screen.findByRole('dialog', { name: 'Edit item' })
     expect(JSON.parse((within(dialog).getByRole('textbox') as HTMLTextAreaElement).value).name).toBe('Grace')
   })
 
-  it('filters additional scan pages while keeping Load more available for zero matches', async () => {
+  it('keeps page navigation available when filters match no items on the current page', async () => {
     mockFetchByUrl({ scanPayload: { ...scanPayload, items: [scanPayload.items[1]], next_token: 'next' } })
     const originalFetch = fetchMock.getMockImplementation()!
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -380,9 +381,139 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
     expect(screen.getByText('No items match these filters')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Load more' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
     expect(await screen.findByText('Ada')).toBeInTheDocument()
     expect(screen.queryByText('Grace')).not.toBeInTheDocument()
-    expect(screen.getByText('(1 of 2 loaded)')).toBeInTheDocument()
+    expect(screen.getByText('(1 of 1 on this page)')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
+    expect(screen.getByText('No items match these filters')).toBeInTheDocument()
+    expect(screen.getByText('(0 of 1 on this page)')).toBeInTheDocument()
+  })
+
+  it.each(['scan', 'query'] as const)('paginates %s results and reuses visited pages without carrying selections', async (mode) => {
+    const firstPage = { ...scanPayload, items: [scanPayload.items[0]], next_token: 'next', count: 1, scanned_count: 1 }
+    mockFetchByUrl({ scanPayload: firstPage, queryPayload: firstPage })
+    const originalFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input, init) => {
+      const token = String(input).includes('/query')
+        ? JSON.parse(init!.body as string).exclusive_start_key
+        : new URL(String(input), 'http://localhost').searchParams.get('exclusive_start_key')
+      if (token === 'next') return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ ...scanPayload, items: [scanPayload.items[1]], count: 1, scanned_count: 1 }),
+      } as Response)
+      return originalFetch(input, init)
+    })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    if (mode === 'query') {
+      fireEvent.click(screen.getByText('Query'))
+      expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '1' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+      await screen.findByText('Ada')
+    }
+    expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Previous page' })).toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(within(screen.getByText('Ada').closest('tr')!).getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('Grace')
+    expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Page 2' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
+    expect(screen.getByText('Ada')).toBeInTheDocument()
+    expect(screen.queryByText('Grace')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Page 2' }))
+    expect(screen.getByText('Grace')).toBeInTheDocument()
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+  })
+
+  it.each(['scan', 'query'] as const)('restarts %s pagination when the page size changes or items are refreshed', async (mode) => {
+    mockFetchByUrl({ scanPayload: { ...scanPayload, next_token: 'next' }, queryPayload: { ...queryPayload, next_token: 'next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    if (mode === 'query') {
+      fireEvent.click(screen.getByText('Query'))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '1' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+      await screen.findByText('Ada')
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+    const trigger = screen.getByRole('button', { name: /Page size/ })
+    const select = createWrapper(document.body).findAllSelects().find((candidate) => candidate.findTrigger().getElement() === trigger)!
+    act(() => select.openDropdown())
+    act(() => select.selectOptionByValue('50'))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.filter(([url]) => String(url).includes(mode === 'scan' ? '/items?' : '/query')).at(-1)!
+      if (mode === 'scan') {
+        const params = new URL(String(call[0]), 'http://localhost').searchParams
+        expect(params.get('limit')).toBe('50')
+        expect(params.has('exclusive_start_key')).toBe(false)
+      } else {
+        expect(JSON.parse(call[1]!.body as string)).toMatchObject({ limit: 50, exclusive_start_key: null })
+      }
+      expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+    })
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reload items' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument())
+    await screen.findByText('Ada')
+    expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
+  })
+
+  it('pages the submitted query and starts over when a different query is run', async () => {
+    mockFetchByUrl({ queryPayload: { ...queryPayload, next_token: 'query-next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByText('Query'))
+    const pk = screen.getByRole('textbox', { name: 'Partition key (id)' })
+    fireEvent.change(pk, { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+    await screen.findByText('Ada')
+    fireEvent.change(pk, { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+    const queryCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/query'))
+    expect(JSON.parse(queryCalls().at(-1)![1]!.body as string)).toMatchObject({
+      partition_key_value: '1', exclusive_start_key: 'query-next', limit: 25,
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+    await waitFor(() => expect(queryCalls()).toHaveLength(3))
+    await screen.findByText('Ada')
+    expect(JSON.parse(queryCalls().at(-1)![1]!.body as string)).toMatchObject({
+      partition_key_value: '2', exclusive_start_key: null,
+    })
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the current page after a failed request so Next can be retried', async () => {
+    mockFetchByUrl({ scanPayload: { ...scanPayload, next_token: 'next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    fetchMock.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ error: 'Unavailable', items: [] }) } as Response)
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('Ada')
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+  })
+
+  it('ignores an in-flight scan page after switching to queries', async () => {
+    mockFetchByUrl({ scanPayload: { ...scanPayload, next_token: 'next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    let resolvePage!: (response: Response) => void
+    fetchMock.mockReturnValueOnce(new Promise((resolve) => { resolvePage = resolve }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    fireEvent.click(screen.getByText('Query'))
+    await act(async () => resolvePage({ ok: true, json: () => Promise.resolve(scanPayload) } as Response))
+    expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
   })
 })

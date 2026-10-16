@@ -34,7 +34,7 @@ export function DynamoDBItemFilters({
 
   return (
     <SpaceBetween size="s">
-      <Header variant="h3" description="Filter loaded items. All comparisons use text, including numbers.">
+      <Header variant="h3" description="Filter items on this page. All comparisons use text, including numbers.">
         Filters <Box variant="span" color="text-body-secondary">(optional)</Box>
       </Header>
       <AttributeEditor

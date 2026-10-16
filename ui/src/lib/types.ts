@@ -170,6 +170,7 @@ export interface DynamoDBQueryRequest {
   sort_key_value?: string | null
   sort_key_operator?: string
   limit?: number
+  exclusive_start_key?: string | null
 }
 
 export interface DynamoDBQueryResponse {
@@ -177,6 +178,7 @@ export interface DynamoDBQueryResponse {
   items: DynamoDBItem[]
   count: number
   scanned_count: number
+  next_token: string | null
 }
 
 export type DynamoDBItemFormat = 'dynamodb' | 'plain'
