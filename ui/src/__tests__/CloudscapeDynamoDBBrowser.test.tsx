@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import createWrapper from '@cloudscape-design/components/test-utils/dom'
 
 vi.mock('@/hooks/useEndpoint', () => ({
   useEndpoint: () => ({
@@ -79,20 +80,22 @@ const queryPayload = {
   items: [{ id: { S: '1' }, name: { S: 'Ada' }, score: { N: '95' } }],
   count: 1,
   scanned_count: 1,
+  next_token: null,
 }
 
-let fetchMock: ReturnType<typeof vi.fn>
+type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+let fetchMock: ReturnType<typeof vi.fn<FetchImplementation>>
 
-function mockFetchByUrl() {
+function mockFetchByUrl(overrides: { tableDetail?: unknown; scanPayload?: unknown; queryPayload?: unknown } = {}) {
   fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? 'GET'
     let payload: unknown = statsPayload
     if (url.includes('/items/batch')) payload = { ok: true, table: 'learners' }
-    else if (url.includes('/query')) payload = queryPayload
-    else if (url.includes('/items')) payload = method === 'GET' ? scanPayload : { ok: true, table: 'learners' }
+    else if (url.includes('/query')) payload = overrides.queryPayload ?? queryPayload
+    else if (url.includes('/items')) payload = method === 'GET' ? overrides.scanPayload ?? scanPayload : { ok: true, table: 'learners' }
     else if (url.includes('/tags')) payload = { tags: {} }
-    else if (url.includes('/api/dynamodb/tables/learners')) payload = tableDetail
+    else if (url.includes('/api/dynamodb/tables/learners')) payload = overrides.tableDetail ?? tableDetail
     else if (url.includes('/api/dynamodb/tables')) payload = tablesPayload
     else if (url.includes('/api/stats')) payload = statsPayload
     return Promise.resolve({ ok: true, json: () => Promise.resolve(payload) } as Response)
@@ -108,6 +111,18 @@ function renderDynamo(path = '/resources/dynamodb') {
       </Routes>
     </MemoryRouter>,
   )
+}
+
+function fillFilter(index: number, column: string, value: string) {
+  fireEvent.change(screen.getByLabelText(`Filter ${index} column`), { target: { value: column } })
+  fireEvent.change(screen.getByRole('textbox', { name: `Filter ${index} search text` }), { target: { value } })
+}
+
+function chooseFilterOperator(index: number, value: string) {
+  const field = createWrapper(document.body).findAttributeEditor()!.findRow(index)!.findField(2)!.getElement()
+  const select = createWrapper(field).findSelect()!
+  act(() => select.openDropdown())
+  act(() => select.selectOptionByValue(value))
 }
 
 beforeEach(() => {
@@ -129,6 +144,48 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(await screen.findByText('id (S)')).toBeInTheDocument()
     expect(await screen.findByText('Ada')).toBeInTheDocument()
     expect(await screen.findByText('Grace')).toBeInTheDocument()
+  })
+
+  it('uses partition key values for editing and keeps deletion in the selection toolbar', async () => {
+    renderDynamo('/resources/dynamodb?table=learners')
+    const row = (await screen.findByText('Ada')).closest('tr')!
+    expect(within(row).getByRole('button', { name: 'Edit item with id: 1' })).toHaveTextContent('1')
+    expect(within(row).queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
+
+    fireEvent.click(within(row).getByRole('checkbox'))
+    expect(screen.getByRole('button', { name: 'Delete selected (1)' })).toBeEnabled()
+  })
+
+  it('edits and batch-deletes the correct item when rows share a partition key', async () => {
+    mockFetchByUrl({
+      tableDetail: { ...tableDetail, sort_key: 'revision', sort_key_type: 'N' },
+      scanPayload: {
+        ...scanPayload,
+        items: [
+          { id: { S: 'shared' }, revision: { N: '1' }, name: { S: 'Ada' } },
+          { id: { S: 'shared' }, revision: { N: '2' }, name: { S: 'Grace' } },
+        ],
+      },
+    })
+    renderDynamo('/resources/dynamodb?table=learners')
+    const row = (await screen.findByText('Grace')).closest('tr')!
+    fireEvent.click(within(row).getByRole('button', { name: 'Edit item with id: shared' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Edit item' })
+    const textarea = within(dialog).getByRole('textbox') as HTMLTextAreaElement
+    expect(JSON.parse(textarea.value)).toEqual({ id: 'shared', revision: 2, name: 'Grace' })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(within(row).getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete selected (1)' }))
+    await waitFor(() => {
+      const batchCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/items/batch'))
+      expect(batchCall).toBeTruthy()
+      const body = JSON.parse((batchCall![1] as RequestInit).body as string)
+      expect(body.operations).toEqual([{ op: 'delete', key: { id: { S: 'shared' }, revision: { N: '2' } } }])
+    })
   })
 
   it('runs a query with the typed partition key', async () => {
@@ -191,7 +248,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     renderDynamo()
     fireEvent.click(await screen.findByRole('link', { name: 'learners' }))
     await screen.findByText('Ada')
-    fireEvent.click(screen.getAllByText('Edit')[0])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 1' }))
 
     const getTextarea = () =>
       screen.getAllByRole('textbox').find((el) => el.tagName === 'TEXTAREA') as HTMLTextAreaElement
@@ -215,7 +272,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     renderDynamo()
     fireEvent.click(await screen.findByRole('link', { name: 'learners' }))
     await screen.findByText('Ada')
-    fireEvent.click(screen.getAllByText('Edit')[1])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 2' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Save item' }))
 
     await waitFor(() => {
@@ -247,5 +304,216 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(body.operations).toHaveLength(2)
     expect(body.operations[0].op).toBe('delete')
     expect(body.operations[0].key.id.S).toBe('1')
+  })
+
+  it('adds, combines, removes, and clears optional text filters without refetching', async () => {
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    expect(screen.getByText('Grace')).toBeInTheDocument()
+    fillFilter(1, 'name', 'ADA')
+    expect(screen.getByText('Ada')).toBeInTheDocument()
+    expect(screen.queryByText('Grace')).not.toBeInTheDocument()
+    expect(screen.getByText('(1 of 2 on this page)')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Match case' }))
+    expect(screen.getByText('No items match these filters')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Match case' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(2, 'score', '98')
+    chooseFilterOperator(2, 'equals')
+    expect(screen.getByText('No items match these filters')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Any filter'))
+    expect(screen.getByText('Ada')).toBeInTheDocument()
+    expect(screen.getByText('Grace')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove filter 2' }))
+    expect(screen.queryByText('Grace')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    expect(screen.getByText('Grace')).toBeInTheDocument()
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+  })
+
+  it('clears previous selections and bulk-deletes only selected filtered rows', async () => {
+    renderDynamo('/resources/dynamodb?table=learners')
+    const grace = (await screen.findByText('Grace')).closest('tr')!
+    fireEvent.click(within(grace).getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(1, 'name', 'Ada')
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
+    const table = screen.getByText('Ada').closest('table')!
+    fireEvent.click(within(table).getAllByRole('checkbox')[0])
+    fireEvent.click(screen.getByRole('button', { name: 'Delete selected (1)' }))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url]) => String(url).includes('/items/batch'))
+      expect(call).toBeTruthy()
+      expect(JSON.parse((call![1] as RequestInit).body as string).operations).toEqual([{ op: 'delete', key: { id: { S: '1' } } }])
+    })
+  })
+
+  it('applies existing filters to query results and keeps key-value editing available', async () => {
+    mockFetchByUrl({ queryPayload: scanPayload })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(1, 'name', 'Grace')
+    fireEvent.click(screen.getByText('Query'))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+    await screen.findByRole('button', { name: 'Edit item with id: 2' })
+    expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 2' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Edit item' })
+    expect(JSON.parse((within(dialog).getByRole('textbox') as HTMLTextAreaElement).value).name).toBe('Grace')
+  })
+
+  it('keeps page navigation available when filters match no items on the current page', async () => {
+    mockFetchByUrl({ scanPayload: { ...scanPayload, items: [scanPayload.items[1]], next_token: 'next' } })
+    const originalFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('exclusive_start_key=next')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ ...scanPayload, items: [scanPayload.items[0]] }) } as Response)
+      }
+      return originalFetch(input, init)
+    })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Grace')
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(1, 'name', 'Ada')
+    expect(screen.getByText('No items match these filters')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    expect(await screen.findByText('Ada')).toBeInTheDocument()
+    expect(screen.queryByText('Grace')).not.toBeInTheDocument()
+    expect(screen.getByText('(1 of 1 on this page)')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
+    expect(screen.getByText('No items match these filters')).toBeInTheDocument()
+    expect(screen.getByText('(0 of 1 on this page)')).toBeInTheDocument()
+  })
+
+  it.each(['scan', 'query'] as const)('paginates %s results and reuses visited pages without carrying selections', async (mode) => {
+    const firstPage = { ...scanPayload, items: [scanPayload.items[0]], next_token: 'next', count: 1, scanned_count: 1 }
+    mockFetchByUrl({ scanPayload: firstPage, queryPayload: firstPage })
+    const originalFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input, init) => {
+      const token = String(input).includes('/query')
+        ? JSON.parse(init!.body as string).exclusive_start_key
+        : new URL(String(input), 'http://localhost').searchParams.get('exclusive_start_key')
+      if (token === 'next') return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ ...scanPayload, items: [scanPayload.items[1]], count: 1, scanned_count: 1 }),
+      } as Response)
+      return originalFetch(input, init)
+    })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    if (mode === 'query') {
+      fireEvent.click(screen.getByText('Query'))
+      expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '1' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+      await screen.findByText('Ada')
+    }
+    expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Previous page' })).toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(within(screen.getByText('Ada').closest('tr')!).getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('Grace')
+    expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Page 2' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
+    expect(screen.getByText('Ada')).toBeInTheDocument()
+    expect(screen.queryByText('Grace')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Page 2' }))
+    expect(screen.getByText('Grace')).toBeInTheDocument()
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+  })
+
+  it.each(['scan', 'query'] as const)('restarts %s pagination when the page size changes or items are refreshed', async (mode) => {
+    mockFetchByUrl({ scanPayload: { ...scanPayload, next_token: 'next' }, queryPayload: { ...queryPayload, next_token: 'next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    if (mode === 'query') {
+      fireEvent.click(screen.getByText('Query'))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '1' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+      await screen.findByText('Ada')
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+    const trigger = screen.getByRole('button', { name: /Page size/ })
+    const select = createWrapper(document.body).findAllSelects().find((candidate) => candidate.findTrigger().getElement() === trigger)!
+    act(() => select.openDropdown())
+    act(() => select.selectOptionByValue('50'))
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.filter(([url]) => String(url).includes(mode === 'scan' ? '/items?' : '/query')).at(-1)!
+      if (mode === 'scan') {
+        const params = new URL(String(call[0]), 'http://localhost').searchParams
+        expect(params.get('limit')).toBe('50')
+        expect(params.has('exclusive_start_key')).toBe(false)
+      } else {
+        expect(JSON.parse(call[1]!.body as string)).toMatchObject({ limit: 50, exclusive_start_key: null })
+      }
+      expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+    })
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reload items' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument())
+    await screen.findByText('Ada')
+    expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
+  })
+
+  it('pages the submitted query and starts over when a different query is run', async () => {
+    mockFetchByUrl({ queryPayload: { ...queryPayload, next_token: 'query-next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByText('Query'))
+    const pk = screen.getByRole('textbox', { name: 'Partition key (id)' })
+    fireEvent.change(pk, { target: { value: '1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+    await screen.findByText('Ada')
+    fireEvent.change(pk, { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+    const queryCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/query'))
+    expect(JSON.parse(queryCalls().at(-1)![1]!.body as string)).toMatchObject({
+      partition_key_value: '1', exclusive_start_key: 'query-next', limit: 25,
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+    await waitFor(() => expect(queryCalls()).toHaveLength(3))
+    await screen.findByText('Ada')
+    expect(JSON.parse(queryCalls().at(-1)![1]!.body as string)).toMatchObject({
+      partition_key_value: '2', exclusive_start_key: null,
+    })
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the current page after a failed request so Next can be retried', async () => {
+    mockFetchByUrl({ scanPayload: { ...scanPayload, next_token: 'next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    fetchMock.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ error: 'Unavailable', items: [] }) } as Response)
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('Ada')
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByRole('button', { name: 'Page 2' })
+  })
+
+  it('ignores an in-flight scan page after switching to queries', async () => {
+    mockFetchByUrl({ scanPayload: { ...scanPayload, next_token: 'next' } })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    let resolvePage!: (response: Response) => void
+    fetchMock.mockReturnValueOnce(new Promise((resolve) => { resolvePage = resolve }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    fireEvent.click(screen.getByText('Query'))
+    await act(async () => resolvePage({ ok: true, json: () => Promise.resolve(scanPayload) } as Response))
+    expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
   })
 })

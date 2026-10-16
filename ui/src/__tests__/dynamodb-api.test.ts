@@ -94,6 +94,17 @@ describe('fetchDynamoDBItems', () => {
 })
 
 describe('queryDynamoDBTable', () => {
+  it('forwards the continuation token and returns the next query page token', async () => {
+    mockOk({ table: 'users', items: [], count: 0, scanned_count: 0, next_token: 'next-page' })
+    const result = await queryDynamoDBTable('users', {
+      partition_key_value: 'user1', limit: 50, exclusive_start_key: 'previous-page',
+    })
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toMatchObject({
+      exclusive_start_key: 'previous-page', limit: 50,
+    })
+    expect(result.next_token).toBe('next-page')
+  })
+
   it('sends POST with correct body', async () => {
     mockOk({ table: 'users', items: [], count: 0 })
     await queryDynamoDBTable('users', {

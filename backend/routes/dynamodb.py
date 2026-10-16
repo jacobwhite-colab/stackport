@@ -361,14 +361,26 @@ def query_table(name: str, request: QueryRequest, ep: EndpointInfo = Depends(get
             "Limit": request.limit,
         }
 
+        if request.exclusive_start_key:
+            try:
+                decoded = base64.b64decode(request.exclusive_start_key, validate=True).decode("utf-8")
+                query_params["ExclusiveStartKey"] = _item_from_json(json.loads(decoded))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail="Invalid pagination token") from e
+
         resp = dynamodb.query(**query_params)
         items = resp.get("Items", [])
+        last_evaluated_key = resp.get("LastEvaluatedKey")
+        next_token = None
+        if last_evaluated_key:
+            next_token = base64.b64encode(json.dumps(_to_json_safe(last_evaluated_key)).encode("utf-8")).decode("utf-8")
 
         return {
             "table": name,
             "items": _to_json_safe(items),
             "count": len(items),
             "scanned_count": resp.get("ScannedCount", len(items)),
+            "next_token": next_token,
         }
     except HTTPException:
         raise
