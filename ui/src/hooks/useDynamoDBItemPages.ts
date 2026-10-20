@@ -1,17 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import type { DynamoDBScanResponse } from '@/lib/types'
+import type { DynamoDBItem, DynamoDBScanResponse } from '@/lib/types'
 import { filterDynamoDBItems, isItemFilterActive, type DynamoDBItemFilter, type ItemFilterMatchMode } from '@/lib/dynamodb-item-filters'
 
 type FetchPage = (token: string | null) => Promise<DynamoDBScanResponse>
 
+interface PageCursor {
+  token: string | null
+  offset: number
+}
+
+interface ItemPage {
+  items: DynamoDBItem[]
+  nextCursor: PageCursor | null
+}
+
 export function useDynamoDBItemPages(
   fetchPage: FetchPage | null,
+  pageSize: number,
   filters: DynamoDBItemFilter[],
   matchMode: ItemFilterMatchMode,
   caseSensitive: boolean,
 ) {
-  const [pages, setPages] = useState<DynamoDBScanResponse[]>([])
+  const [pages, setPages] = useState<ItemPage[]>([])
   const [currentPageIndex, setCurrentPageIndex] = useState(1)
   const [loading, setLoading] = useState(false)
   const requestId = useRef(0)
@@ -42,36 +53,47 @@ export function useDynamoDBItemPages(
     }
   }, [fetchPage])
 
-  const loadPage = useCallback(async (pageIndex: number, token: string | null, reset = false) => {
+  const loadPage = useCallback(async (pageIndex: number, cursor: PageCursor, reset = false) => {
     if (!fetchPage) return
     const id = ++requestId.current
     setLoading(true)
     try {
-      let next = token
+      let next: PageCursor | null = cursor
+      const items: DynamoDBItem[] = []
       const visited = new Set<string | null>()
-      do {
-        if (visited.has(next)) throw new Error('Pagination token did not advance')
-        visited.add(next)
-        const data = await cache.read(next)
+      while (next && items.length < pageSize) {
+        const { token, offset }: PageCursor = next
+        if (visited.has(token)) throw new Error('Pagination token did not advance')
+        visited.add(token)
+        const data = await cache.read(token)
         if (id !== requestId.current) return
-        if (activeFilters.length === 0 || filterDynamoDBItems(data.items, activeFilters, matchMode, caseSensitive).length > 0) {
-          setPages((previous) => reset ? [data] : [...previous, data])
-          setCurrentPageIndex(pageIndex)
-          return
-        }
-        next = data.next_token
-      } while (next)
+        const matches = filterDynamoDBItems(data.items, activeFilters, matchMode, caseSensitive)
+        const end = Math.min(matches.length, offset + pageSize - items.length)
+        items.push(...matches.slice(offset, end))
+        // A UI page can end partway through the matches in a cached response.
+        next = end < matches.length
+          ? { token, offset: end }
+          : data.next_token ? { token: data.next_token, offset: 0 } : null
+        if (activeFilters.length === 0) break
+      }
+
+      if (items.length > 0 || activeFilters.length === 0) {
+        const page = { items, nextCursor: next }
+        setPages((previous) => reset ? [page] : [...previous, page])
+        setCurrentPageIndex(pageIndex)
+        return
+      }
 
       // Exhausting an empty tail closes Next without creating a blank UI page.
       setPages((previous) => reset ? [] : previous.map((page, index) =>
-        index === previous.length - 1 ? { ...page, next_token: null } : page,
+        index === previous.length - 1 ? { ...page, nextCursor: null } : page,
       ))
     } catch (error) {
       if (id === requestId.current) toast.error(`Failed to load items: ${error}`)
     } finally {
       if (id === requestId.current) setLoading(false)
     }
-  }, [fetchPage, cache, activeFilters, matchMode, caseSensitive])
+  }, [fetchPage, pageSize, cache, activeFilters, matchMode, caseSensitive])
 
   useEffect(() => {
     setPages([])
@@ -79,9 +101,9 @@ export function useDynamoDBItemPages(
     setLoading(!!fetchPage)
     // Debounce edits while keeping cached responses available to the next search.
     const timer = fetchPage && activeFilters.length > 0
-      ? setTimeout(() => { void loadPage(1, null, true) }, 200)
+      ? setTimeout(() => { void loadPage(1, { token: null, offset: 0 }, true) }, 200)
       : undefined
-    if (fetchPage && !timer) void loadPage(1, null, true)
+    if (fetchPage && !timer) void loadPage(1, { token: null, offset: 0 }, true)
     return () => {
       clearTimeout(timer)
       requestId.current += 1
@@ -90,7 +112,7 @@ export function useDynamoDBItemPages(
 
   const reload = () => {
     cache.clear()
-    return loadPage(1, null, true)
+    return loadPage(1, { token: null, offset: 0 }, true)
   }
 
   return { pages, currentPageIndex, setCurrentPageIndex, loading, loadPage, reload }

@@ -191,10 +191,10 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   [detail.name, pageSize, activeEndpoint, mode, submittedQuery])
   const { pages, currentPageIndex, setCurrentPageIndex, loading, loadPage, reload: reloadItems } = useDynamoDBItemPages(
     mode === 'query' && !submittedQuery ? null : fetchPage,
-    filters, filterMatchMode, filterCaseSensitive,
+    pageSize, filters, filterMatchMode, filterCaseSensitive,
   )
   const items = useMemo(() => pages[currentPageIndex - 1]?.items ?? [], [pages, currentPageIndex])
-  const nextToken = pages.at(-1)?.next_token
+  const nextCursor = pages.at(-1)?.nextCursor
   const visibleItems = useMemo(
     () => filterDynamoDBItems(items, filters, filterMatchMode, filterCaseSensitive),
     [items, filters, filterMatchMode, filterCaseSensitive],
@@ -359,7 +359,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
           <Pagination
             currentPageIndex={currentPageIndex}
             pagesCount={Math.max(1, pages.length)}
-            openEnd={!!nextToken}
+            openEnd={!!nextCursor}
             disabled={loading || pages.length === 0}
             ariaLabels={{
               paginationLabel: 'Item pages',
@@ -373,7 +373,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
               setSelected([])
             }}
             onNextPageClick={({ detail: d }) => {
-              if (!d.requestedPageAvailable && nextToken) void loadPage(d.requestedPageIndex, nextToken)
+              if (!d.requestedPageAvailable && nextCursor) void loadPage(d.requestedPageIndex, nextCursor)
             }}
           />
         ) : undefined}

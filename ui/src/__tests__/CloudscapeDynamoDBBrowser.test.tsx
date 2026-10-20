@@ -140,6 +140,21 @@ function fillFilter(index: number, column: string, value: string) {
   fireEvent.change(screen.getByRole('textbox', { name: `Filter ${index} search text` }), { target: { value } })
 }
 
+function choosePageSize(value: string) {
+  const trigger = screen.getByRole('button', { name: /Page size/ })
+  const select = createWrapper(document.body).findAllSelects().find((candidate) => candidate.findTrigger().getElement() === trigger)!
+  act(() => select.openDropdown())
+  act(() => select.selectOptionByValue(value))
+}
+
+function makeItems(prefix: string, count: number, name = 'Ada'): DynamoDBItem[] {
+  return Array.from({ length: count }, (_, index) => ({ id: { S: `${prefix}-${index + 1}` }, name: { S: name } }))
+}
+
+function renderedItemKeys() {
+  return screen.getAllByRole('button', { name: /^Edit item with id:/ }).map((button) => button.textContent)
+}
+
 function chooseFilterOperator(index: number, value: string) {
   const field = createWrapper(document.body).findAttributeEditor()!.findRow(index)!.findField(2)!.getElement()
   const select = createWrapper(field).findSelect()!
@@ -416,34 +431,68 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     })
   })
 
-  it.each(['scan', 'query'] as const)('skips empty middle and trailing %s pages without adding blank page buttons', async (mode) => {
-    const laterAda = { ...scanPayload.items[0], id: { S: '3' } }
-    mockItemPages([[scanPayload.items[0]], [scanPayload.items[1]], [], [laterAda], [scanPayload.items[1]]])
+  it.each(['scan', 'query'] as const)('combines 58 and 31 filtered %s matches into one page at a target of 100', async (mode) => {
+    const first = makeItems('first', 58)
+    const second = makeItems('second', 31)
+    mockItemPages([
+      [...first, ...makeItems('skipped-first', 42, 'Grace')],
+      [...second, ...makeItems('skipped-second', 69, 'Grace')],
+    ])
     renderDynamo('/resources/dynamodb?table=learners')
-    await screen.findByText('Ada')
+    await screen.findByRole('button', { name: 'Edit item with id: first-1' })
+    choosePageSize('100')
+    await screen.findByRole('button', { name: 'Edit item with id: first-1' })
     if (mode === 'query') {
       fireEvent.click(screen.getByText('Query'))
       fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '1' } })
       fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
-      await screen.findByText('Ada')
+      await screen.findByRole('button', { name: 'Edit item with id: first-1' })
     }
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
-    await screen.findByRole('button', { name: 'Edit item with id: 1' })
+    await screen.findByText('(89 matching)', {}, { timeout: 3000 })
+    expect(renderedItemKeys()).toEqual([...first, ...second].map((item) => (item.id as { S: string }).S))
+    expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
+  })
+
+  it.each(['scan', 'query'] as const)('fills %s pages to 100 and preserves overflow from the final response', async (mode) => {
+    const first = makeItems('first', 58)
+    const second = makeItems('second', 67)
+    mockItemPages([
+      [...first, ...makeItems('skipped-first', 42, 'Grace')],
+      [],
+      [...second, ...makeItems('skipped-second', 33, 'Grace')],
+    ])
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByRole('button', { name: 'Edit item with id: first-1' })
+    choosePageSize('100')
+    await screen.findByRole('button', { name: 'Edit item with id: first-1' })
+    if (mode === 'query') {
+      fireEvent.click(screen.getByText('Query'))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '1' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+      await screen.findByRole('button', { name: 'Edit item with id: first-1' })
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(1, 'name', 'Ada')
+    await screen.findByText('(100 matching)', {}, { timeout: 3000 })
+    const expectedKeys = [...first, ...second].map((item) => (item.id as { S: string }).S)
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 100))
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.click(within(screen.getByRole('button', { name: 'Edit item with id: first-1' }).closest('tr')!).getByRole('checkbox'))
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
-    await screen.findByRole('button', { name: 'Edit item with id: 3' })
-    expect(screen.getByRole('button', { name: 'Page 2' })).toHaveAttribute('aria-current', 'true')
-    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true'))
-    await screen.findByRole('button', { name: 'Edit item with id: 3' })
+    await screen.findByText('(25 matching)')
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(100))
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
     expect(screen.getByRole('button', { name: 'Page 2' })).toHaveAttribute('aria-current', 'true')
     expect(screen.queryByRole('button', { name: 'Page 3' })).not.toBeInTheDocument()
-    const callsBefore = fetchMock.mock.calls.length
     fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
-    expect(screen.getByRole('button', { name: 'Edit item with id: 1' })).toBeInTheDocument()
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 100))
     fireEvent.click(screen.getByRole('button', { name: 'Page 2' }))
-    expect(screen.getByRole('button', { name: 'Edit item with id: 3' })).toBeInTheDocument()
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(100))
     expect(fetchMock.mock.calls).toHaveLength(callsBefore)
   })
 
@@ -484,7 +533,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(fetchMock.mock.calls).toHaveLength(callsBefore)
   })
 
-  it('abandons an obsolete filter search without fetching further pages', async () => {
+  it('abandons an obsolete filter search when filters are cleared without fetching further pages', async () => {
     mockItemPages([[scanPayload.items[1]], [scanPayload.items[0]], [scanPayload.items[0]]])
     const originalFetch = fetchMock.getMockImplementation()!
     let resolvePage!: (response: Response) => void
@@ -496,7 +545,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
     await waitFor(() => expect(resolvePage).toBeDefined())
-    fillFilter(1, 'name', 'Grace')
+    fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
     await screen.findByText('Grace')
     await act(async () => resolvePage({ ok: true, json: () => Promise.resolve({
       ...scanPayload, items: [scanPayload.items[0]], next_token: 'cursor-2',
@@ -559,10 +608,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
     await screen.findByRole('button', { name: 'Page 2' })
-    const trigger = screen.getByRole('button', { name: /Page size/ })
-    const select = createWrapper(document.body).findAllSelects().find((candidate) => candidate.findTrigger().getElement() === trigger)!
-    act(() => select.openDropdown())
-    act(() => select.selectOptionByValue('50'))
+    choosePageSize('50')
     await waitFor(() => {
       const call = fetchMock.mock.calls.filter(([url]) => String(url).includes(mode === 'scan' ? '/items?' : '/query')).at(-1)!
       if (mode === 'scan') {

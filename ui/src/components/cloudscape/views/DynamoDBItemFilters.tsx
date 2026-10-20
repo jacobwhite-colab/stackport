@@ -34,7 +34,7 @@ export function DynamoDBItemFilters({
 
   return (
     <SpaceBetween size="s">
-      <Header variant="h3" description="Pages without matches are skipped automatically. All comparisons use text, including numbers.">
+      <Header variant="h3" description="Filtered pages fill up to the selected page size. All comparisons use text, including numbers.">
         Filters <Box variant="span" color="text-body-secondary">(optional)</Box>
       </Header>
       <AttributeEditor
