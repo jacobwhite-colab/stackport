@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useCollection } from '@cloudscape-design/collection-hooks'
 import Alert from '@cloudscape-design/components/alert'
@@ -35,11 +35,12 @@ import {
   queryDynamoDBTable,
   updateDynamoDBItem,
 } from '@/lib/api'
-import type { DynamoDBItem, DynamoDBQueryRequest, DynamoDBScanResponse, DynamoDBTable, DynamoDBTableDetail } from '@/lib/types'
+import type { DynamoDBItem, DynamoDBQueryRequest, DynamoDBTable, DynamoDBTableDetail } from '@/lib/types'
 import { dynamoItemToPlainMap, extractKeyDynamo, plainItemToDynamoMap } from '@/lib/dynamodb-marshal'
 import { filterDynamoDBItems, isItemFilterActive, type DynamoDBItemFilter, type ItemFilterMatchMode } from '@/lib/dynamodb-item-filters'
 import { useEndpoint } from '@/hooks/useEndpoint'
 import { useFetch } from '@/hooks/useFetch'
+import { useDynamoDBItemPages } from '@/hooks/useDynamoDBItemPages'
 import { DynamoDBItemFilters } from './DynamoDBItemFilters'
 
 const SORT_OPERATORS = ['=', '<', '<=', '>', '>=', 'BEGINS_WITH'].map((op) => ({ value: op, label: op }))
@@ -172,22 +173,26 @@ function ItemEditorModal({
 
 function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   const { activeEndpoint } = useEndpoint()
-  const [pages, setPages] = useState<DynamoDBScanResponse[]>([])
-  const [currentPageIndex, setCurrentPageIndex] = useState(1)
-  const [loading, setLoading] = useState(false)
   const [pageSize, setPageSize] = useState(25)
   const [mode, setMode] = useState<'scan' | 'query'>('scan')
   const [queryPk, setQueryPk] = useState('')
   const [querySk, setQuerySk] = useState('')
   const [querySkOp, setQuerySkOp] = useState('=')
   const [submittedQuery, setSubmittedQuery] = useState<DynamoDBQueryRequest | null>(null)
-  const requestId = useRef(0)
   const [selected, setSelected] = useState<DynamoDBItem[]>([])
   const [editor, setEditor] = useState<{ mode: 'create' | 'edit'; item: Record<string, unknown>; format: 'plain' | 'dynamodb' } | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [filters, setFilters] = useState<DynamoDBItemFilter[]>([])
   const [filterMatchMode, setFilterMatchMode] = useState<ItemFilterMatchMode>('all')
   const [filterCaseSensitive, setFilterCaseSensitive] = useState(false)
+  const fetchPage = useCallback((token: string | null) => mode === 'scan'
+    ? fetchDynamoDBItems(detail.name, pageSize, token, activeEndpoint)
+    : queryDynamoDBTable(detail.name, { ...submittedQuery!, limit: pageSize, exclusive_start_key: token }, activeEndpoint),
+  [detail.name, pageSize, activeEndpoint, mode, submittedQuery])
+  const { pages, currentPageIndex, setCurrentPageIndex, loading, loadPage, reload: reloadItems } = useDynamoDBItemPages(
+    mode === 'query' && !submittedQuery ? null : fetchPage,
+    filters, filterMatchMode, filterCaseSensitive,
+  )
   const items = useMemo(() => pages[currentPageIndex - 1]?.items ?? [], [pages, currentPageIndex])
   const nextToken = pages.at(-1)?.next_token
   const visibleItems = useMemo(
@@ -195,33 +200,6 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
     [items, filters, filterMatchMode, filterCaseSensitive],
   )
   const filtersActive = filters.some(isItemFilterActive)
-
-  const loadPage = useCallback(
-    async (pageIndex: number, token: string | null, reset = false) => {
-      if (mode === 'query' && !submittedQuery) return
-      const id = ++requestId.current
-      setLoading(true)
-      setSelected([])
-      try {
-        const data = mode === 'scan'
-          ? await fetchDynamoDBItems(detail.name, pageSize, token, activeEndpoint)
-          : await queryDynamoDBTable(detail.name, {
-            ...submittedQuery!,
-            limit: pageSize,
-            exclusive_start_key: token,
-          }, activeEndpoint)
-        if (id !== requestId.current) return
-        if ('error' in data) throw new Error(String(data.error))
-        setPages((previous) => reset ? [data] : [...previous, data])
-        setCurrentPageIndex(pageIndex)
-      } catch (err) {
-        if (id === requestId.current) toast.error(`${mode === 'scan' ? 'Scan' : 'Query'} failed: ${err}`)
-      } finally {
-        if (id === requestId.current) setLoading(false)
-      }
-    },
-    [detail.name, pageSize, activeEndpoint, mode, submittedQuery],
-  )
 
   const runQuery = () => {
     if (!queryPk.trim()) {
@@ -236,16 +214,9 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
     })
   }
 
-  const reloadItems = () => loadPage(1, null, true)
-
   useEffect(() => {
-    setPages([])
-    setCurrentPageIndex(1)
     setSelected([])
-    if (mode === 'scan' || submittedQuery) void loadPage(1, null, true)
-    else setLoading(false)
-    return () => { requestId.current += 1 }
-  }, [mode, submittedQuery, loadPage])
+  }, [pages, currentPageIndex, loading])
 
   const allColumns = useMemo(() => {
     const keys = new Set<string>()
@@ -341,14 +312,14 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
           resizerTooltipText: 'Drag to resize, or press Enter and use the arrow keys',
         }}
         loading={loading}
-        loadingText="Loading items"
+        loadingText={filtersActive ? 'Searching for matching items' : 'Loading items'}
         selectionType="multi"
         selectedItems={selected}
         onSelectionChange={({ detail: d }) => setSelected(d.selectedItems as DynamoDBItem[])}
         header={
           <Header
             variant="h3"
-            counter={filtersActive ? `(${visibleItems.length} of ${items.length} on this page)` : `(${items.length})`}
+            counter={filtersActive ? `(${visibleItems.length} matching)` : `(${items.length})`}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button iconName="refresh" onClick={reloadItems} loading={loading} disabled={mode === 'query' && !submittedQuery} ariaLabel="Reload items" />
@@ -364,7 +335,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
             Items
           </Header>
         }
-        empty={<Box textAlign="center">{filtersActive && items.length > 0 ? 'No items match these filters' : 'No items'}</Box>}
+        empty={<Box textAlign="center">{filtersActive ? 'No items match these filters' : 'No items'}</Box>}
         columnDefinitions={columns.map((key) => ({
           id: key,
           header: key,
@@ -384,7 +355,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
             ) : value
           },
         }))}
-        pagination={
+        pagination={pages.length > 0 ? (
           <Pagination
             currentPageIndex={currentPageIndex}
             pagesCount={Math.max(1, pages.length)}
@@ -405,7 +376,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
               if (!d.requestedPageAvailable && nextToken) void loadPage(d.requestedPageIndex, nextToken)
             }}
           />
-        }
+        ) : undefined}
       />
 
       {editor && (
