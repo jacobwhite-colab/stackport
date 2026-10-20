@@ -37,7 +37,7 @@ import {
 } from '@/lib/api'
 import type { DynamoDBItem, DynamoDBQueryRequest, DynamoDBTable, DynamoDBTableDetail } from '@/lib/types'
 import { dynamoItemToPlainMap, extractKeyDynamo, plainItemToDynamoMap } from '@/lib/dynamodb-marshal'
-import { filterDynamoDBItems, isItemFilterActive, type DynamoDBItemFilter, type ItemFilterMatchMode } from '@/lib/dynamodb-item-filters'
+import { isItemFilterActive, type DynamoDBItemFilter, type ItemFilterMatchMode } from '@/lib/dynamodb-item-filters'
 import { useEndpoint } from '@/hooks/useEndpoint'
 import { useFetch } from '@/hooks/useFetch'
 import { useDynamoDBItemPages } from '@/hooks/useDynamoDBItemPages'
@@ -185,21 +185,31 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   const [filters, setFilters] = useState<DynamoDBItemFilter[]>([])
   const [filterMatchMode, setFilterMatchMode] = useState<ItemFilterMatchMode>('all')
   const [filterCaseSensitive, setFilterCaseSensitive] = useState(false)
+  const [appliedFilterSettings, setAppliedFilterSettings] = useState<{
+    filters: DynamoDBItemFilter[]
+    matchMode: ItemFilterMatchMode
+    caseSensitive: boolean
+  }>({ filters: [], matchMode: 'all', caseSensitive: false })
   const fetchPage = useCallback((token: string | null) => mode === 'scan'
     ? fetchDynamoDBItems(detail.name, pageSize, token, activeEndpoint)
     : queryDynamoDBTable(detail.name, { ...submittedQuery!, limit: pageSize, exclusive_start_key: token }, activeEndpoint),
   [detail.name, pageSize, activeEndpoint, mode, submittedQuery])
   const { pages, currentPageIndex, setCurrentPageIndex, loading, loadPage, reload: reloadItems } = useDynamoDBItemPages(
     mode === 'query' && !submittedQuery ? null : fetchPage,
-    pageSize, filters, filterMatchMode, filterCaseSensitive,
+    pageSize, appliedFilterSettings.filters, appliedFilterSettings.matchMode, appliedFilterSettings.caseSensitive,
   )
   const items = useMemo(() => pages[currentPageIndex - 1]?.items ?? [], [pages, currentPageIndex])
   const nextCursor = pages.at(-1)?.nextCursor
-  const visibleItems = useMemo(
-    () => filterDynamoDBItems(items, filters, filterMatchMode, filterCaseSensitive),
-    [items, filters, filterMatchMode, filterCaseSensitive],
-  )
-  const filtersActive = filters.some(isItemFilterActive)
+  const filtersActive = appliedFilterSettings.filters.length > 0
+
+  const runFilters = () => {
+    setAppliedFilterSettings({
+      filters: filters.filter(isItemFilterActive),
+      matchMode: filterMatchMode,
+      caseSensitive: filterCaseSensitive,
+    })
+    setSelected([])
+  }
 
   const runQuery = () => {
     if (!queryPk.trim()) {
@@ -297,13 +307,15 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         filters={filters}
         matchMode={filterMatchMode}
         caseSensitive={filterCaseSensitive}
-        onChange={(next) => { setFilters(next); setSelected([]) }}
-        onMatchModeChange={(next) => { setFilterMatchMode(next); setSelected([]) }}
-        onCaseSensitiveChange={(next) => { setFilterCaseSensitive(next); setSelected([]) }}
+        onChange={setFilters}
+        onMatchModeChange={setFilterMatchMode}
+        onCaseSensitiveChange={setFilterCaseSensitive}
       />
 
+      <Box><Button variant="primary" onClick={runFilters}>Run filters</Button></Box>
+
       <Table
-        items={visibleItems}
+        items={items}
         trackBy={(item) => JSON.stringify(item)}
         variant="embedded"
         resizableColumns
@@ -319,7 +331,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         header={
           <Header
             variant="h3"
-            counter={filtersActive ? `(${visibleItems.length} matching)` : `(${items.length})`}
+            counter={filtersActive ? `(${items.length} matching)` : `(${items.length})`}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button iconName="refresh" onClick={reloadItems} loading={loading} disabled={mode === 'query' && !submittedQuery} ariaLabel="Reload items" />

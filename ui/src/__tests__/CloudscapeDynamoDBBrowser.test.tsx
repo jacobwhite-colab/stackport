@@ -140,6 +140,10 @@ function fillFilter(index: number, column: string, value: string) {
   fireEvent.change(screen.getByRole('textbox', { name: `Filter ${index} search text` }), { target: { value } })
 }
 
+function runFilters() {
+  fireEvent.click(screen.getByRole('button', { name: 'Run filters' }))
+}
+
 function choosePageSize(value: string) {
   const trigger = screen.getByRole('button', { name: /Page size/ })
   const select = createWrapper(document.body).findAllSelects().find((candidate) => candidate.findTrigger().getElement() === trigger)!
@@ -152,7 +156,7 @@ function makeItems(prefix: string, count: number, name = 'Ada'): DynamoDBItem[] 
 }
 
 function renderedItemKeys() {
-  return screen.getAllByRole('button', { name: /^Edit item with id:/ }).map((button) => button.textContent)
+  return screen.getAllByRole('button', { name: /^Edit item with id:/, hidden: true }).map((button) => button.textContent)
 }
 
 function chooseFilterOperator(index: number, value: string) {
@@ -343,32 +347,74 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(body.operations[0].key.id.S).toBe('1')
   })
 
-  it('adds, combines, removes, and clears optional text filters without refetching', async () => {
+  it.each(['scan', 'query'] as const)('applies %s filters only when Run filters is clicked, even after a typing pause', async (mode) => {
+    mockItemPages([[scanPayload.items[1]], [scanPayload.items[0]]])
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Grace')
+    if (mode === 'query') {
+      fireEvent.click(screen.getByText('Query'))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '1' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+      await screen.findByText('Grace')
+    }
+    const grace = screen.getByText('Grace').closest('tr')!
+    fireEvent.click(within(grace).getByRole('checkbox'))
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(1, 'name', 'Ada')
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)) })
+    expect(screen.getByText('Grace')).toBeInTheDocument()
+    expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete selected (1)' })).toBeEnabled()
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    runFilters()
+    await screen.findByText('Ada')
+    expect(screen.queryByText('Grace')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
+
+    fillFilter(1, 'name', 'Grace')
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)) })
+    expect(screen.getByText('Ada')).toBeInTheDocument()
+    expect(screen.queryByText('Grace')).not.toBeInTheDocument()
+    runFilters()
+    await screen.findByText('Grace')
+    expect(screen.queryByText('Ada')).not.toBeInTheDocument()
+  })
+
+  it('adds, combines, removes, and clears optional text filters on Run without refetching', async () => {
     renderDynamo('/resources/dynamodb?table=learners')
     await screen.findByText('Ada')
     const callsBefore = fetchMock.mock.calls.length
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     expect(screen.getByText('Grace')).toBeInTheDocument()
     fillFilter(1, 'name', 'ADA')
+    runFilters()
     await screen.findByText('Ada')
     expect(screen.queryByText('Grace')).not.toBeInTheDocument()
     expect(screen.getByText('(1 matching)')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Match case' }))
+    expect(screen.getByText('Ada')).toBeInTheDocument()
+    runFilters()
     await screen.findByText('No items match these filters')
     fireEvent.click(screen.getByRole('checkbox', { name: 'Match case' }))
+    runFilters()
     await screen.findByText('Ada')
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(2, 'score', '98')
     chooseFilterOperator(2, 'equals')
+    runFilters()
     await screen.findByText('No items match these filters')
     fireEvent.click(screen.getByText('Any filter'))
+    runFilters()
     await screen.findByText('Ada')
     expect(screen.getByText('Grace')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Remove filter 2' }))
+    runFilters()
     await screen.findByText('Ada')
     expect(screen.queryByText('Grace')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    runFilters()
     await screen.findByText('Grace')
     expect(fetchMock.mock.calls).toHaveLength(callsBefore)
   })
@@ -379,6 +425,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(within(grace).getByRole('checkbox'))
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
+    runFilters()
     expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
     const table = (await screen.findByText('Ada')).closest('table')!
     fireEvent.click(within(table).getAllByRole('checkbox')[0])
@@ -396,6 +443,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     await screen.findByText('Ada')
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Grace')
+    runFilters()
     fireEvent.click(screen.getByText('Query'))
     fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (id)' }), { target: { value: '2' } })
     fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
@@ -418,6 +466,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
+    runFilters()
     expect(await screen.findByText('Ada')).toBeInTheDocument()
     expect(screen.queryByText('Grace')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
@@ -450,6 +499,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
+    runFilters()
     await screen.findByText('(89 matching)', {}, { timeout: 3000 })
     expect(renderedItemKeys()).toEqual([...first, ...second].map((item) => (item.id as { S: string }).S))
     expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
@@ -477,10 +527,12 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
+    runFilters()
     await screen.findByText('(100 matching)', {}, { timeout: 3000 })
     const expectedKeys = [...first, ...second].map((item) => (item.id as { S: string }).S)
     expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 100))
     const callsBefore = fetchMock.mock.calls.length
+    fillFilter(1, 'name', 'Grace')
     fireEvent.click(within(screen.getByRole('button', { name: 'Edit item with id: first-1' }).closest('tr')!).getByRole('checkbox'))
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
     await screen.findByText('(25 matching)')
@@ -493,6 +545,25 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 100))
     fireEvent.click(screen.getByRole('button', { name: 'Page 2' }))
     expect(renderedItemKeys()).toEqual(expectedKeys.slice(100))
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+  }, 15000)
+
+  it('restarts on page 1 when Run filters is clicked again with unchanged criteria', async () => {
+    mockItemPages([makeItems('first', 25), makeItems('second', 1)])
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByRole('button', { name: 'Edit item with id: first-1' })
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(1, 'name', 'Ada')
+    runFilters()
+    await screen.findByText('(25 matching)')
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('(1 matching)')
+    const callsBefore = fetchMock.mock.calls.length
+    runFilters()
+    await screen.findByText('(25 matching)')
+    expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.getByRole('button', { name: 'Edit item with id: first-25' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit item with id: second-1' })).not.toBeInTheDocument()
     expect(fetchMock.mock.calls).toHaveLength(callsBefore)
   })
 
@@ -508,6 +579,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
+    runFilters()
     await screen.findByText('No items match these filters')
     expect(screen.queryByRole('button', { name: 'Page 1' })).not.toBeInTheDocument()
     const calls = fetchMock.mock.calls.filter(([url]) => String(url).includes(mode === 'scan' ? '/items?' : '/query'))
@@ -520,13 +592,16 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     await screen.findByText('Grace')
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
+    runFilters()
     await screen.findByText('Ada')
     const callsBefore = fetchMock.mock.calls.length
     fillFilter(1, 'name', 'Grace')
+    runFilters()
     await screen.findByText('Grace')
     expect(screen.queryByText('Ada')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
     fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    runFilters()
     await screen.findByText('Grace')
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
     await screen.findByText('Ada')
@@ -544,8 +619,10 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     await screen.findByText('Grace')
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
+    runFilters()
     await waitFor(() => expect(resolvePage).toBeDefined())
     fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    runFilters()
     await screen.findByText('Grace')
     await act(async () => resolvePage({ ok: true, json: () => Promise.resolve({
       ...scanPayload, items: [scanPayload.items[0]], next_token: 'cursor-2',

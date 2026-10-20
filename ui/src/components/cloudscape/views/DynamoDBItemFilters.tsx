@@ -34,18 +34,18 @@ export function DynamoDBItemFilters({
 
   return (
     <SpaceBetween size="s">
-      <Header variant="h3" description="Filtered pages fill up to the selected page size. All comparisons use text, including numbers.">
+      <Header variant="h3" description="Choose filters, then select Run filters. Pages fill up to the selected size, and all comparisons use text.">
         Filters <Box variant="span" color="text-body-secondary">(optional)</Box>
       </Header>
       <AttributeEditor
         items={filters}
-        empty={<Box color="text-body-secondary">No filters applied</Box>}
+        empty={<Box color="text-body-secondary">No filters added</Box>}
         addButtonText="Add filter"
         removeButtonText="Remove"
         removeButtonAriaLabel={(filter) => `Remove filter ${filters.indexOf(filter) + 1}`}
         onAddButtonClick={() => onChange([...filters, { column: '', operator: 'contains', value: '' }])}
         onRemoveButtonClick={({ detail }) => onChange(filters.filter((_, index) => index !== detail.itemIndex))}
-        additionalInfo={filters.length > 0 ? 'Complete both column and search text to apply a filter.' : undefined}
+        additionalInfo={filters.length > 0 ? 'Complete both column and search text, then select Run filters.' : undefined}
         additionalActions={filters.length > 0 ? (
           <SpaceBetween direction="horizontal" size="s">
             {filters.length > 1 && (

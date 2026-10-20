@@ -26,9 +26,7 @@ export function useDynamoDBItemPages(
   const [currentPageIndex, setCurrentPageIndex] = useState(1)
   const [loading, setLoading] = useState(false)
   const requestId = useRef(0)
-  // Incomplete filter rows don't change the results or restart a search.
-  const filterKey = JSON.stringify(filters.filter(isItemFilterActive))
-  const activeFilters = useMemo(() => JSON.parse(filterKey) as DynamoDBItemFilter[], [filterKey])
+  const activeFilters = useMemo(() => filters.filter(isItemFilterActive), [filters])
 
   const cache = useMemo(() => {
     const responses = new Map<string | null, Promise<DynamoDBScanResponse>>()
@@ -99,13 +97,8 @@ export function useDynamoDBItemPages(
     setPages([])
     setCurrentPageIndex(1)
     setLoading(!!fetchPage)
-    // Debounce edits while keeping cached responses available to the next search.
-    const timer = fetchPage && activeFilters.length > 0
-      ? setTimeout(() => { void loadPage(1, { token: null, offset: 0 }, true) }, 200)
-      : undefined
-    if (fetchPage && !timer) void loadPage(1, { token: null, offset: 0 }, true)
+    if (fetchPage) void loadPage(1, { token: null, offset: 0 }, true)
     return () => {
-      clearTimeout(timer)
       requestId.current += 1
     }
   }, [fetchPage, activeFilters, loadPage])
