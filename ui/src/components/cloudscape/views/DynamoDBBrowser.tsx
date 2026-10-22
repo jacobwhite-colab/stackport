@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useCollection } from '@cloudscape-design/collection-hooks'
 import Alert from '@cloudscape-design/components/alert'
@@ -27,7 +27,7 @@ import { LEARN_HOTSPOTS } from '@/components/cloudscape/learn/hotspots'
 import {
   batchWriteDynamoDBItems,
   createDynamoDBTable,
-  deleteDynamoDBItem,
+  fetchDynamoDBItem,
   fetchDynamoDBItems,
   fetchDynamoDBTable,
   fetchDynamoDBTables,
@@ -36,10 +36,13 @@ import {
   queryDynamoDBTable,
   updateDynamoDBItem,
 } from '@/lib/api'
-import type { DynamoDBItem, DynamoDBTable, DynamoDBTableDetail } from '@/lib/types'
+import type { DynamoDBItem, DynamoDBQueryRequest, DynamoDBTable, DynamoDBTableDetail } from '@/lib/types'
 import { dynamoItemToPlainMap, extractKeyDynamo, plainItemToDynamoMap } from '@/lib/dynamodb-marshal'
+import { isItemFilterActive, type DynamoDBItemFilter, type ItemFilterMatchMode } from '@/lib/dynamodb-item-filters'
 import { useEndpoint } from '@/hooks/useEndpoint'
 import { useFetch } from '@/hooks/useFetch'
+import { useDynamoDBItemPages } from '@/hooks/useDynamoDBItemPages'
+import { DynamoDBItemFilters } from './DynamoDBItemFilters'
 
 const SORT_OPERATORS = ['=', '<', '<=', '>', '>=', 'BEGINS_WITH'].map((op) => ({ value: op, label: op }))
 const PAGE_SIZES = [25, 50, 100].map((n) => ({ value: String(n), label: `${n} items` }))
@@ -171,73 +174,116 @@ function ItemEditorModal({
 
 function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   const { activeEndpoint } = useEndpoint()
-  const [items, setItems] = useState<DynamoDBItem[]>([])
-  const [nextToken, setNextToken] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
   const [pageSize, setPageSize] = useState(25)
   const [mode, setMode] = useState<'scan' | 'query'>('scan')
+  const [indexName, setIndexName] = useState('')
+  const selectedIndex = detail.global_secondary_indexes.find((index) => index.IndexName === indexName)
+  const readPartitionKey = selectedIndex
+    ? selectedIndex.KeySchema.find((key) => key.KeyType === 'HASH')?.AttributeName
+    : detail.partition_key
+  const readSortKey = selectedIndex
+    ? selectedIndex.KeySchema.find((key) => key.KeyType === 'RANGE')?.AttributeName
+    : detail.sort_key
   const [queryPk, setQueryPk] = useState('')
   const [querySk, setQuerySk] = useState('')
   const [querySkOp, setQuerySkOp] = useState('=')
+  const [submittedQuery, setSubmittedQuery] = useState<DynamoDBQueryRequest | null>(null)
   const [selected, setSelected] = useState<DynamoDBItem[]>([])
   const [editor, setEditor] = useState<{ mode: 'create' | 'edit'; item: Record<string, unknown>; format: 'plain' | 'dynamodb' } | null>(null)
   const [deleting, setDeleting] = useState(false)
-
-  const scan = useCallback(
-    async (append = false, token?: string | null) => {
-      setLoading(true)
-      try {
-        const data = await fetchDynamoDBItems(detail.name, pageSize, token ?? undefined, activeEndpoint)
-        setItems((prev) => (append ? [...prev, ...data.items] : data.items))
-        setNextToken(data.next_token)
-        setSelected([])
-      } catch (err) {
-        toast.error(`Scan failed: ${err}`)
-      } finally {
-        setLoading(false)
-      }
-    },
-    [detail.name, pageSize, activeEndpoint],
+  const [openingItem, setOpeningItem] = useState<DynamoDBItem | null>(null)
+  const editRequestId = useRef(0)
+  const [filters, setFilters] = useState<DynamoDBItemFilter[]>([])
+  const [filterMatchMode, setFilterMatchMode] = useState<ItemFilterMatchMode>('all')
+  const [filterCaseSensitive, setFilterCaseSensitive] = useState(false)
+  const [appliedFilterSettings, setAppliedFilterSettings] = useState<{
+    filters: DynamoDBItemFilter[]
+    matchMode: ItemFilterMatchMode
+    caseSensitive: boolean
+  }>({ filters: [], matchMode: 'all', caseSensitive: false })
+  const fetchPage = useCallback((token: string | null) => mode === 'scan'
+    ? fetchDynamoDBItems(detail.name, pageSize, token, activeEndpoint, indexName || null)
+    : queryDynamoDBTable(detail.name, { ...submittedQuery!, limit: pageSize, exclusive_start_key: token }, activeEndpoint),
+  [detail.name, pageSize, activeEndpoint, mode, submittedQuery, indexName])
+  const { pages, currentPageIndex, setCurrentPageIndex, loading, loadPage, reload: reloadItems } = useDynamoDBItemPages(
+    mode === 'query' && !submittedQuery ? null : fetchPage,
+    pageSize, appliedFilterSettings.filters, appliedFilterSettings.matchMode, appliedFilterSettings.caseSensitive,
   )
+  const items = useMemo(() => pages[currentPageIndex - 1]?.items ?? [], [pages, currentPageIndex])
+  const nextCursor = pages.at(-1)?.nextCursor
+  const filtersActive = appliedFilterSettings.filters.length > 0
 
-  const runQuery = useCallback(async () => {
+  const runFilters = () => {
+    setAppliedFilterSettings({
+      filters: filters.filter(isItemFilterActive),
+      matchMode: filterMatchMode,
+      caseSensitive: filterCaseSensitive,
+    })
+    setSelected([])
+  }
+
+  const runQuery = () => {
     if (!queryPk.trim()) {
       toast.error('Enter a partition key value')
       return
     }
-    setLoading(true)
-    try {
-      const data = await queryDynamoDBTable(
-        detail.name,
-        {
-          partition_key_value: queryPk,
-          sort_key_value: querySk || null,
-          sort_key_operator: querySkOp,
-          limit: pageSize,
-        },
-        activeEndpoint,
-      )
-      setItems(data.items)
-      setNextToken(null)
-      setSelected([])
-    } catch (err) {
-      toast.error(`Query failed: ${err}`)
-    } finally {
-      setLoading(false)
+    // Keep paging the submitted query even while the form contains unsent edits.
+    setSubmittedQuery({
+      partition_key_value: queryPk,
+      sort_key_value: querySk || null,
+      sort_key_operator: querySkOp,
+      index_name: indexName || null,
+    })
+  }
+
+  const selectIndex = useCallback((name: string) => {
+    setIndexName(name)
+    setQueryPk('')
+    setQuerySk('')
+    setQuerySkOp('=')
+    setSubmittedQuery(null)
+    setSelected([])
+  }, [])
+
+  const editItem = async (item: DynamoDBItem) => {
+    if (!selectedIndex) {
+      setEditor({ mode: 'edit', item, format: 'dynamodb' })
+      return
     }
-  }, [detail.name, queryPk, querySk, querySkOp, pageSize, activeEndpoint])
+    const id = ++editRequestId.current
+    setOpeningItem(item)
+    try {
+      const completeItem = await fetchDynamoDBItem(
+        detail.name, extractKeyDynamo(item, detail.partition_key ?? '', detail.sort_key), activeEndpoint,
+      )
+      if (id === editRequestId.current) setEditor({ mode: 'edit', item: completeItem, format: 'dynamodb' })
+    } catch (error) {
+      if (id === editRequestId.current) toast.error(`Failed to open item: ${error}`)
+    } finally {
+      if (id === editRequestId.current) setOpeningItem(null)
+    }
+  }
 
   useEffect(() => {
-    if (mode === 'scan') scan()
-  }, [mode, scan])
+    setSelected([])
+  }, [pages, currentPageIndex, loading])
 
-  const columns = useMemo(() => {
+  useEffect(() => () => { editRequestId.current += 1 }, [detail.name, activeEndpoint])
+
+  useEffect(() => {
+    if (indexName && !selectedIndex) selectIndex('')
+  }, [indexName, selectedIndex, selectIndex])
+
+  const allColumns = useMemo(() => {
     const keys = new Set<string>()
     if (detail.partition_key) keys.add(detail.partition_key)
     if (detail.sort_key) keys.add(detail.sort_key)
+    if (readPartitionKey) keys.add(readPartitionKey)
+    if (readSortKey) keys.add(readSortKey)
     for (const item of items) for (const k of Object.keys(item)) keys.add(k)
-    return [...keys].slice(0, 8)
-  }, [items, detail])
+    return [...keys]
+  }, [items, detail, readPartitionKey, readSortKey])
+  const columns = useMemo(() => allColumns.slice(0, 8), [allColumns])
 
   const deleteSelected = async () => {
     setDeleting(true)
@@ -249,8 +295,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
       await batchWriteDynamoDBItems(detail.name, operations, 'dynamodb', activeEndpoint)
       toast.success(`Deleted ${selected.length} item(s)`)
       setSelected([])
-      if (mode === 'scan') scan()
-      else runQuery()
+      void reloadItems()
     } catch (err) {
       toast.error(`Failed to delete items: ${err}`)
     } finally {
@@ -258,21 +303,25 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
     }
   }
 
-  const deleteOne = async (item: DynamoDBItem) => {
-    try {
-      const key = extractKeyDynamo(item, detail.partition_key ?? '', detail.sort_key)
-      await deleteDynamoDBItem(detail.name, key, 'dynamodb', activeEndpoint)
-      toast.success('Item deleted')
-      if (mode === 'scan') scan()
-      else runQuery()
-    } catch (err) {
-      toast.error(`Failed to delete item: ${err}`)
-    }
-  }
-
   return (
     <SpaceBetween size="m">
       <SpaceBetween direction="horizontal" size="s">
+        {detail.global_secondary_indexes.length > 0 && (
+          <Select
+            ariaLabel="Table or index"
+            selectedOption={{ value: indexName, label: selectedIndex ? `GSI: ${selectedIndex.IndexName}` : `Table: ${detail.name}` }}
+            options={[
+              { value: '', label: `Table: ${detail.name}` },
+              ...detail.global_secondary_indexes.map((index) => ({
+                value: index.IndexName,
+                label: `GSI: ${index.IndexName}`,
+                description: index.IndexStatus,
+              })),
+            ]}
+            disabled={!!openingItem}
+            onChange={({ detail: d }) => selectIndex(d.selectedOption.value ?? '')}
+          />
+        )}
         <SegmentedControl
           selectedId={mode}
           onChange={({ detail: d }) => setMode(d.selectedId as 'scan' | 'query')}
@@ -290,12 +339,20 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         />
       </SpaceBetween>
 
+      {selectedIndex && (
+        <Box color="text-body-secondary" fontSize="body-s">
+          Index keys: {readPartitionKey} ({detail.attribute_definitions[readPartitionKey ?? ''] ?? 'S'})
+          {readSortKey ? `, ${readSortKey} (${detail.attribute_definitions[readSortKey] ?? 'S'})` : ''}.
+          {' '}Projection: {selectedIndex.Projection?.ProjectionType ?? 'unknown'}. Filters search projected attributes.
+        </Box>
+      )}
+
       {mode === 'query' && (
         <SpaceBetween direction="horizontal" size="s">
-          <FormField label={`Partition key (${detail.partition_key ?? 'pk'})`}>
+          <FormField label={`Partition key (${readPartitionKey ?? 'pk'})`}>
             <Input value={queryPk} onChange={({ detail: d }) => setQueryPk(d.value)} />
           </FormField>
-          {detail.sort_key && (
+          {readSortKey && (
             <>
               <FormField label="Operator">
                 <Select
@@ -304,7 +361,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
                   options={SORT_OPERATORS}
                 />
               </FormField>
-              <FormField label={`Sort key (${detail.sort_key})`}>
+              <FormField label={`Sort key (${readSortKey})`}>
                 <Input value={querySk} onChange={({ detail: d }) => setQuerySk(d.value)} />
               </FormField>
             </>
@@ -317,22 +374,39 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         </SpaceBetween>
       )}
 
+      <DynamoDBItemFilters
+        columns={allColumns}
+        filters={filters}
+        matchMode={filterMatchMode}
+        caseSensitive={filterCaseSensitive}
+        onChange={setFilters}
+        onMatchModeChange={setFilterMatchMode}
+        onCaseSensitiveChange={setFilterCaseSensitive}
+      />
+
+      <Box><Button variant="primary" onClick={runFilters}>Run filters</Button></Box>
+
       <Table
         items={items}
         trackBy={(item) => JSON.stringify(item)}
         variant="embedded"
-        loading={loading && items.length === 0}
-        loadingText="Loading items"
+        resizableColumns
+        ariaLabels={{
+          resizerRoleDescription: 'Column resize handle',
+          resizerTooltipText: 'Drag to resize, or press Enter and use the arrow keys',
+        }}
+        loading={loading}
+        loadingText={filtersActive ? 'Searching for matching items' : 'Loading items'}
         selectionType="multi"
         selectedItems={selected}
         onSelectionChange={({ detail: d }) => setSelected(d.selectedItems as DynamoDBItem[])}
         header={
           <Header
             variant="h3"
-            counter={`(${items.length})`}
+            counter={filtersActive ? `(${items.length} matching)` : `(${items.length})`}
             actions={
               <SpaceBetween direction="horizontal" size="xs">
-                <Button iconName="refresh" onClick={() => (mode === 'scan' ? scan() : runQuery())} loading={loading} ariaLabel="Reload items" />
+                <Button iconName="refresh" onClick={reloadItems} loading={loading} disabled={mode === 'query' && !submittedQuery} ariaLabel="Reload items" />
                 <Button disabled={selected.length === 0} loading={deleting} onClick={deleteSelected}>
                   Delete selected ({selected.length})
                 </Button>
@@ -345,38 +419,50 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
             Items
           </Header>
         }
-        empty={<Box textAlign="center">No items</Box>}
-        columnDefinitions={[
-          ...columns.map((key) => ({
-            id: key,
-            header: key,
-            cell: (item: DynamoDBItem) => formatAttribute(dynamoItemToPlainMap(item)[key]),
-          })),
-          {
-            id: 'actions',
-            header: '',
-            width: 140,
-            cell: (item: DynamoDBItem) => (
-              <SpaceBetween direction="horizontal" size="xs">
-                <Button variant="inline-link" onClick={() => setEditor({ mode: 'edit', item: item as Record<string, unknown>, format: 'dynamodb' })}>
-                  Edit
-                </Button>
-                <Button variant="inline-link" onClick={() => deleteOne(item)}>
-                  Delete
-                </Button>
-              </SpaceBetween>
-            ),
-          },
-        ]}
-        footer={
-          mode === 'scan' && nextToken ? (
-            <Box textAlign="center">
-              <Button onClick={() => scan(true, nextToken)} loading={loading}>
-                Load more
+        empty={<Box textAlign="center">{filtersActive ? 'No items match these filters' : 'No items'}</Box>}
+        columnDefinitions={columns.map((key) => ({
+          id: key,
+          header: key,
+          width: 180,
+          cell: (item: DynamoDBItem) => {
+            const value = formatAttribute(dynamoItemToPlainMap(item)[key])
+            return key === detail.partition_key ? (
+              <Button
+                variant="inline-link"
+                wrapText={false}
+                className="max-w-full truncate"
+                ariaLabel={`Edit item with ${key}: ${value}`}
+                loading={openingItem === item}
+                disabled={!!openingItem}
+                onClick={() => { void editItem(item) }}
+              >
+                {value}
               </Button>
-            </Box>
-          ) : undefined
-        }
+            ) : value
+          },
+        }))}
+        pagination={pages.length > 0 ? (
+          <Pagination
+            currentPageIndex={currentPageIndex}
+            pagesCount={Math.max(1, pages.length)}
+            openEnd={!!nextCursor}
+            disabled={loading || pages.length === 0}
+            ariaLabels={{
+              paginationLabel: 'Item pages',
+              previousPageLabel: 'Previous page',
+              nextPageLabel: 'Next page',
+              pageLabel: (page) => `Page ${page}`,
+            }}
+            onChange={({ detail: d }) => {
+              if (d.currentPageIndex > pages.length) return
+              setCurrentPageIndex(d.currentPageIndex)
+              setSelected([])
+            }}
+            onNextPageClick={({ detail: d }) => {
+              if (!d.requestedPageAvailable && nextCursor) void loadPage(d.requestedPageIndex, nextCursor)
+            }}
+          />
+        ) : undefined}
       />
 
       {editor && (
@@ -388,8 +474,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
           onClose={() => setEditor(null)}
           onDone={() => {
             setEditor(null)
-            if (mode === 'scan') scan()
-            else runQuery()
+            void reloadItems()
           }}
         />
       )}

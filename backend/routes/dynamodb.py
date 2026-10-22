@@ -278,6 +278,7 @@ def scan_table(
     name: str,
     limit: int = Query(default=25, ge=1, le=100, description="Max items per page"),
     exclusive_start_key: str = Query(default=None, description="Base64 encoded last evaluated key for pagination"),
+    index_name: str | None = Query(default=None, description="Secondary index to scan instead of the table"),
     ep: EndpointInfo = Depends(get_endpoint_info),
 ):
     dynamodb = get_client("dynamodb", **ep.client_kwargs())
@@ -286,6 +287,8 @@ def scan_table(
         "TableName": name,
         "Limit": limit,
     }
+    if index_name:
+        scan_params["IndexName"] = index_name
 
     if exclusive_start_key:
         try:
@@ -321,10 +324,15 @@ def query_table(name: str, request: QueryRequest, ep: EndpointInfo = Depends(get
     dynamodb = get_client("dynamodb", **ep.client_kwargs())
 
     try:
-        # Get table key schema
         table_resp = dynamodb.describe_table(TableName=name)
         table = table_resp["Table"]
         key_schema = table.get("KeySchema", [])
+        if request.index_name:
+            indexes = table.get("GlobalSecondaryIndexes", []) + table.get("LocalSecondaryIndexes", [])
+            index = next((index for index in indexes if index["IndexName"] == request.index_name), None)
+            if not index:
+                raise HTTPException(status_code=400, detail=f"Index {request.index_name!r} does not exist on this table")
+            key_schema = index.get("KeySchema", [])
         attribute_defs = {attr["AttributeName"]: attr["AttributeType"] for attr in table.get("AttributeDefinitions", [])}
 
         partition_key = next((k["AttributeName"] for k in key_schema if k["KeyType"] == "HASH"), None)
@@ -336,22 +344,22 @@ def query_table(name: str, request: QueryRequest, ep: EndpointInfo = Depends(get
         partition_key_type = attribute_defs.get(partition_key, "S")
 
         # Build key condition expression
-        key_condition = f"#{partition_key} = :pk"
-        expression_attr_names = {f"#{partition_key}": partition_key}
+        key_condition = "#pk = :pk"
+        expression_attr_names = {"#pk": partition_key}
         expression_attr_values = {":pk": _key_value(partition_key_type, request.partition_key_value, partition_key)}
 
         if sort_key and request.sort_key_value:
             sort_key_type = attribute_defs.get(sort_key, "S")
             if request.sort_key_operator == "=":
-                key_condition += f" AND #{sort_key} = :sk"
+                key_condition += " AND #sk = :sk"
                 expression_attr_values[":sk"] = _key_value(sort_key_type, request.sort_key_value, sort_key)
             elif request.sort_key_operator in ("<", "<=", ">", ">="):
-                key_condition += f" AND #{sort_key} {request.sort_key_operator} :sk"
+                key_condition += f" AND #sk {request.sort_key_operator} :sk"
                 expression_attr_values[":sk"] = _key_value(sort_key_type, request.sort_key_value, sort_key)
             elif request.sort_key_operator == "BEGINS_WITH":
-                key_condition += f" AND begins_with(#{sort_key}, :sk)"
+                key_condition += " AND begins_with(#sk, :sk)"
                 expression_attr_values[":sk"] = _key_value(sort_key_type, request.sort_key_value, sort_key)
-            expression_attr_names[f"#{sort_key}"] = sort_key
+            expression_attr_names["#sk"] = sort_key
 
         query_params = {
             "TableName": name,
@@ -360,21 +368,60 @@ def query_table(name: str, request: QueryRequest, ep: EndpointInfo = Depends(get
             "ExpressionAttributeValues": expression_attr_values,
             "Limit": request.limit,
         }
+        if request.index_name:
+            query_params["IndexName"] = request.index_name
+
+        if request.exclusive_start_key:
+            try:
+                decoded = base64.b64decode(request.exclusive_start_key, validate=True).decode("utf-8")
+                query_params["ExclusiveStartKey"] = _item_from_json(json.loads(decoded))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail="Invalid pagination token") from e
 
         resp = dynamodb.query(**query_params)
         items = resp.get("Items", [])
+        last_evaluated_key = resp.get("LastEvaluatedKey")
+        next_token = None
+        if last_evaluated_key:
+            next_token = base64.b64encode(json.dumps(_to_json_safe(last_evaluated_key)).encode("utf-8")).decode("utf-8")
 
         return {
             "table": name,
             "items": _to_json_safe(items),
             "count": len(items),
             "scanned_count": resp.get("ScannedCount", len(items)),
+            "next_token": next_token,
         }
     except HTTPException:
         raise
     except Exception as e:
         logger.error("Failed to query table %s: %s", name, e, exc_info=True)
         return {"error": str(e), "items": [], "count": 0}
+
+
+@router.get("/tables/{name}/item")
+def get_table_item(
+    name: str,
+    key: str = Query(description="JSON-encoded DynamoDB primary key"),
+    ep: EndpointInfo = Depends(get_endpoint_info),
+):
+    dynamodb = get_client("dynamodb", **ep.client_kwargs())
+    try:
+        try:
+            typed_key = _coerce_key_dict(json.loads(key), "dynamodb")
+        except (ValueError, TypeError, AttributeError) as e:
+            raise HTTPException(status_code=400, detail="Invalid item key") from e
+        partition_key, sort_key = _get_partition_sort_keys(dynamodb, name)
+        _require_key_attributes(typed_key, partition_key, sort_key, label="key")
+        response = dynamodb.get_item(TableName=name, Key=typed_key, ConsistentRead=True)
+        if "Item" not in response:
+            raise HTTPException(status_code=404, detail="Item no longer exists in the table")
+        return {"table": name, "item": _to_json_safe(response["Item"])}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to read item in %s: %s", name, e, exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Failed to read item: {e}") from e
 
 
 @router.api_route("/tables/{name}/items", methods=["POST", "PUT"])

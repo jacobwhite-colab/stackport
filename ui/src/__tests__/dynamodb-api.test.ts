@@ -3,6 +3,7 @@ import {
   batchWriteDynamoDBItems,
   deleteDynamoDBItem,
   fetchDynamoDBTable,
+  fetchDynamoDBItem,
   fetchDynamoDBItems,
   fetchDynamoDBTables,
   putDynamoDBItem,
@@ -63,6 +64,13 @@ describe('fetchDynamoDBTable', () => {
 })
 
 describe('fetchDynamoDBItems', () => {
+  it('keeps the selected index and endpoint on paginated scans', async () => {
+    mockOk({ items: [], next_token: null })
+    await fetchDynamoDBItems('users', 50, 'cursor+/=', 'local', 'by-status')
+    const url = new URL(mockFetch.mock.calls[0][0], 'http://localhost')
+    expect(Object.fromEntries(url.searchParams)).toEqual({ limit: '50', exclusive_start_key: 'cursor+/=', index_name: 'by-status', endpoint: 'local' })
+  })
+
   it('calls correct URL with default params', async () => {
     mockOk({ table: 'users', items: [], count: 0 })
     await fetchDynamoDBItems('users')
@@ -94,6 +102,17 @@ describe('fetchDynamoDBItems', () => {
 })
 
 describe('queryDynamoDBTable', () => {
+  it('forwards the continuation token and returns the next query page token', async () => {
+    mockOk({ table: 'users', items: [], count: 0, scanned_count: 0, next_token: 'next-page' })
+    const result = await queryDynamoDBTable('users', {
+      partition_key_value: 'user1', limit: 50, exclusive_start_key: 'previous-page', index_name: 'by-status',
+    })
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toMatchObject({
+      exclusive_start_key: 'previous-page', limit: 50, index_name: 'by-status',
+    })
+    expect(result.next_token).toBe('next-page')
+  })
+
   it('sends POST with correct body', async () => {
     mockOk({ table: 'users', items: [], count: 0 })
     await queryDynamoDBTable('users', {
@@ -121,6 +140,24 @@ describe('queryDynamoDBTable', () => {
     await expect(
       queryDynamoDBTable('users', { partition_key_value: 'test' })
     ).rejects.toThrow('400')
+  })
+})
+
+describe('fetchDynamoDBItem', () => {
+  it('loads the complete base-table item using its typed primary key', async () => {
+    const key = { id: { B: 'AI7/' }, revision: { N: '9007199254740993' } }
+    const item = { ...key, extra: { S: 'not projected' } }
+    mockOk({ table: 'users', item })
+    expect(await fetchDynamoDBItem('users', key, 'local')).toEqual(item)
+    const url = new URL(mockFetch.mock.calls[0][0], 'http://localhost')
+    expect(url.pathname).toBe('/api/dynamodb/tables/users/item')
+    expect(JSON.parse(url.searchParams.get('key')!)).toEqual(key)
+    expect(url.searchParams.get('endpoint')).toBe('local')
+  })
+
+  it('rejects a missing item instead of returning an index projection for editing', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 404, json: () => Promise.resolve({ detail: 'Item no longer exists' }) })
+    await expect(fetchDynamoDBItem('users', { id: { S: 'gone' } })).rejects.toThrow('404: Item no longer exists')
   })
 })
 
