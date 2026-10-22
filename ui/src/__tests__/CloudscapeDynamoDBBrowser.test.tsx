@@ -84,6 +84,29 @@ const queryPayload = {
   next_token: null,
 }
 
+const indexedTableDetail = {
+  ...tableDetail,
+  sort_key: 'revision', sort_key_type: 'N',
+  attribute_definitions: { id: 'S', revision: 'N', status: 'S', score: 'N', category: 'S' },
+  global_secondary_indexes: [
+    { IndexName: 'by-status', IndexStatus: 'ACTIVE', KeySchema: [
+      { AttributeName: 'status', KeyType: 'HASH' }, { AttributeName: 'score', KeyType: 'RANGE' },
+    ], Projection: { ProjectionType: 'KEYS_ONLY' } },
+    { IndexName: 'by-category', IndexStatus: 'ACTIVE', KeySchema: [
+      { AttributeName: 'category', KeyType: 'HASH' },
+    ], Projection: { ProjectionType: 'ALL' } },
+  ],
+}
+const indexItems = [
+  { id: { S: '1' }, revision: { N: '2' }, status: { S: 'PAID' }, score: { N: '10' } },
+  { id: { S: '2' }, revision: { N: '3' }, status: { S: 'PAID' }, score: { N: '20' } },
+]
+const completeIndexItems = indexItems.map((item, index) => ({
+  ...item, name: { S: index === 0 ? 'Ada' : 'Grace' }, category: { S: 'Books' },
+  notes: { M: { text: { S: 'Not projected into by-status' } } },
+  counter: { N: '9007199254740993' }, tags: { SS: ['a', 'b'] },
+}))
+
 type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 let fetchMock: ReturnType<typeof vi.fn<FetchImplementation>>
 
@@ -125,6 +148,30 @@ function mockItemPages(pages: DynamoDBItem[][]) {
   })
 }
 
+function mockIndexReads(missingItem = false) {
+  mockFetchByUrl({ tableDetail: indexedTableDetail })
+  const originalFetch = fetchMock.getMockImplementation()!
+  fetchMock.mockImplementation((input, init) => {
+    const url = new URL(String(input), 'http://localhost')
+    if (url.pathname.endsWith('/item')) {
+      if (missingItem) return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({ detail: 'Item no longer exists' }) } as Response)
+      const key = JSON.parse(url.searchParams.get('key')!)
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ item: completeIndexItems.find((item) => item.id.S === key.id.S) }) } as Response)
+    }
+    const isQuery = url.pathname.endsWith('/query')
+    const request = isQuery ? JSON.parse(init!.body as string) : null
+    const index = isQuery ? request.index_name : url.searchParams.get('index_name')
+    if (index && (isQuery || (url.pathname.endsWith('/items') && !init?.method))) {
+      const token = isQuery ? request.exclusive_start_key : url.searchParams.get('exclusive_start_key')
+      const items = index === 'by-category' ? completeIndexItems : indexItems
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({
+        ...scanPayload, items: [items[token ? 1 : 0]], count: 1, scanned_count: 1, next_token: token ? null : 'index-next',
+      }) } as Response)
+    }
+    return originalFetch(input, init)
+  })
+}
+
 function renderDynamo(path = '/resources/dynamodb') {
   return render(
     <MemoryRouter initialEntries={[path]}>
@@ -144,12 +191,15 @@ function runFilters() {
   fireEvent.click(screen.getByRole('button', { name: 'Run filters' }))
 }
 
-function choosePageSize(value: string) {
-  const trigger = screen.getByRole('button', { name: /Page size/ })
+function chooseSelect(label: RegExp, value: string) {
+  const trigger = screen.getByRole('button', { name: label })
   const select = createWrapper(document.body).findAllSelects().find((candidate) => candidate.findTrigger().getElement() === trigger)!
   act(() => select.openDropdown())
   act(() => select.selectOptionByValue(value))
 }
+
+function choosePageSize(value: string) { chooseSelect(/Page size/, value) }
+function chooseIndex(value: string) { chooseSelect(/Table or index/, value) }
 
 function makeItems(prefix: string, count: number, name = 'Ada'): DynamoDBItem[] {
   return Array.from({ length: count }, (_, index) => ({ id: { S: `${prefix}-${index + 1}` }, name: { S: name } }))
@@ -172,6 +222,110 @@ beforeEach(() => {
 })
 
 describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
+  it('scans a selected GSI, preserves its cursor, and resets pagination when returning to the table', async () => {
+    mockIndexReads()
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    chooseIndex('by-status')
+    await screen.findByText('10')
+    const first = screen.getByRole('button', { name: 'Edit item with id: 1' }).closest('tr')!
+    fireEvent.click(within(first).getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('20')
+    const scanCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/items?'))
+    const params = new URL(String(scanCalls().at(-1)![0]), 'http://localhost').searchParams
+    expect(params.get('index_name')).toBe('by-status')
+    expect(params.get('exclusive_start_key')).toBe('index-next')
+    expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
+    const callsBefore = fetchMock.mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
+    expect(screen.getByText('10')).toBeInTheDocument()
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    chooseIndex('')
+    await screen.findByText('Ada')
+    const tableParams = new URL(String(scanCalls().at(-1)![0]), 'http://localhost').searchParams
+    expect(tableParams.has('index_name')).toBe(false)
+    expect(tableParams.has('exclusive_start_key')).toBe(false)
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+  })
+
+  it('queries GSI keys, keeps the chosen index through filtering and pagination, and resets keys when switching indexes', async () => {
+    mockIndexReads()
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    chooseIndex('by-status')
+    await screen.findByText('10')
+    fireEvent.click(screen.getByText('Query'))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (status)' }), { target: { value: 'PAID' } })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Sort key (score)' }), { target: { value: '10' } })
+    chooseSelect(/Operator/, '>=')
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+    await screen.findByText('10')
+    fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (status)' }), { target: { value: 'UNSENT' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('20')
+    const queryBodies = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/query')).map(([, init]) => JSON.parse(init!.body as string))
+    expect(queryBodies().at(-1)).toMatchObject({ index_name: 'by-status', partition_key_value: 'PAID', sort_key_value: '10', sort_key_operator: '>=', exclusive_start_key: 'index-next' })
+    fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
+    fillFilter(1, 'score', '20')
+    runFilters()
+    await screen.findByText('(1 matching)')
+    expect(screen.getByRole('button', { name: 'Edit item with id: 2' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit item with id: 1' })).not.toBeInTheDocument()
+    chooseIndex('by-category')
+    expect(screen.getByRole('textbox', { name: 'Partition key (category)' })).toHaveValue('')
+    expect(screen.queryByRole('textbox', { name: 'Sort key (score)' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit item with id: 2' })).not.toBeInTheDocument()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Partition key (category)' }), { target: { value: 'Books' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Run query' }))
+    await screen.findByRole('button', { name: 'Edit item with id: 2' })
+    expect(queryBodies().at(-1)).toMatchObject({ index_name: 'by-category', partition_key_value: 'Books', sort_key_value: null, sort_key_operator: '=' })
+    chooseIndex('')
+    expect(screen.getByRole('textbox', { name: 'Partition key (id)' })).toHaveValue('')
+    expect(screen.getByRole('textbox', { name: 'Sort key (revision)' })).toHaveValue('')
+  })
+
+  it('loads the complete table item before editing a GSI projection and deletes using only base-table keys', async () => {
+    mockIndexReads()
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    chooseIndex('by-status')
+    await screen.findByText('10')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 1' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Edit item' })
+    const json = JSON.parse((within(dialog).getByRole('textbox') as HTMLTextAreaElement).value)
+    expect(json.name).toBe('Ada')
+    expect(json.notes).toEqual({ text: 'Not projected into by-status' })
+    const getCall = fetchMock.mock.calls.find(([url]) => new URL(String(url), 'http://localhost').pathname.endsWith('/item'))!
+    expect(JSON.parse(new URL(String(getCall[0]), 'http://localhost').searchParams.get('key')!)).toEqual({ id: { S: '1' }, revision: { N: '2' } })
+    fireEvent.click(within(dialog).getByText('DynamoDB JSON'))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save item' }))
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')!
+      expect(JSON.parse(put[1]!.body as string).item).toEqual(completeIndexItems[0])
+    })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Edit item' })).not.toBeInTheDocument())
+    const row = (await screen.findByRole('button', { name: 'Edit item with id: 1' })).closest('tr')!
+    fireEvent.click(within(row).getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete selected (1)' }))
+    await waitFor(() => {
+      const batch = fetchMock.mock.calls.find(([url]) => String(url).includes('/items/batch'))!
+      expect(JSON.parse(batch[1]!.body as string).operations).toEqual([{ op: 'delete', key: { id: { S: '1' }, revision: { N: '2' } } }])
+    })
+  })
+
+  it('does not open a projected item for editing when the table item no longer exists', async () => {
+    mockIndexReads(true)
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    chooseIndex('by-status')
+    await screen.findByText('10')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit item with id: 1' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Edit item with id: 1' })).toBeEnabled())
+    expect(screen.queryByRole('dialog', { name: 'Edit item' })).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false)
+  })
+
   it('lists tables with keys and billing', async () => {
     renderDynamo()
     expect(await screen.findByText('learners')).toBeInTheDocument()

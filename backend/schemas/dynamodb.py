@@ -11,6 +11,7 @@ class QueryRequest(BaseModel):
     sort_key_operator: str = "="  # =, <, <=, >, >=, BETWEEN, BEGINS_WITH
     limit: int = 25
     exclusive_start_key: str | None = None
+    index_name: str | None = None
 
 
 class PutItemRequest(BaseModel):

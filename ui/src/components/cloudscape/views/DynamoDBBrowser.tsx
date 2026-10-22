@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useCollection } from '@cloudscape-design/collection-hooks'
 import Alert from '@cloudscape-design/components/alert'
@@ -27,6 +27,7 @@ import { LEARN_HOTSPOTS } from '@/components/cloudscape/learn/hotspots'
 import {
   batchWriteDynamoDBItems,
   createDynamoDBTable,
+  fetchDynamoDBItem,
   fetchDynamoDBItems,
   fetchDynamoDBTable,
   fetchDynamoDBTables,
@@ -175,6 +176,14 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   const { activeEndpoint } = useEndpoint()
   const [pageSize, setPageSize] = useState(25)
   const [mode, setMode] = useState<'scan' | 'query'>('scan')
+  const [indexName, setIndexName] = useState('')
+  const selectedIndex = detail.global_secondary_indexes.find((index) => index.IndexName === indexName)
+  const readPartitionKey = selectedIndex
+    ? selectedIndex.KeySchema.find((key) => key.KeyType === 'HASH')?.AttributeName
+    : detail.partition_key
+  const readSortKey = selectedIndex
+    ? selectedIndex.KeySchema.find((key) => key.KeyType === 'RANGE')?.AttributeName
+    : detail.sort_key
   const [queryPk, setQueryPk] = useState('')
   const [querySk, setQuerySk] = useState('')
   const [querySkOp, setQuerySkOp] = useState('=')
@@ -182,6 +191,8 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   const [selected, setSelected] = useState<DynamoDBItem[]>([])
   const [editor, setEditor] = useState<{ mode: 'create' | 'edit'; item: Record<string, unknown>; format: 'plain' | 'dynamodb' } | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [openingItem, setOpeningItem] = useState<DynamoDBItem | null>(null)
+  const editRequestId = useRef(0)
   const [filters, setFilters] = useState<DynamoDBItemFilter[]>([])
   const [filterMatchMode, setFilterMatchMode] = useState<ItemFilterMatchMode>('all')
   const [filterCaseSensitive, setFilterCaseSensitive] = useState(false)
@@ -191,9 +202,9 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
     caseSensitive: boolean
   }>({ filters: [], matchMode: 'all', caseSensitive: false })
   const fetchPage = useCallback((token: string | null) => mode === 'scan'
-    ? fetchDynamoDBItems(detail.name, pageSize, token, activeEndpoint)
+    ? fetchDynamoDBItems(detail.name, pageSize, token, activeEndpoint, indexName || null)
     : queryDynamoDBTable(detail.name, { ...submittedQuery!, limit: pageSize, exclusive_start_key: token }, activeEndpoint),
-  [detail.name, pageSize, activeEndpoint, mode, submittedQuery])
+  [detail.name, pageSize, activeEndpoint, mode, submittedQuery, indexName])
   const { pages, currentPageIndex, setCurrentPageIndex, loading, loadPage, reload: reloadItems } = useDynamoDBItemPages(
     mode === 'query' && !submittedQuery ? null : fetchPage,
     pageSize, appliedFilterSettings.filters, appliedFilterSettings.matchMode, appliedFilterSettings.caseSensitive,
@@ -221,20 +232,57 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
       partition_key_value: queryPk,
       sort_key_value: querySk || null,
       sort_key_operator: querySkOp,
+      index_name: indexName || null,
     })
+  }
+
+  const selectIndex = useCallback((name: string) => {
+    setIndexName(name)
+    setQueryPk('')
+    setQuerySk('')
+    setQuerySkOp('=')
+    setSubmittedQuery(null)
+    setSelected([])
+  }, [])
+
+  const editItem = async (item: DynamoDBItem) => {
+    if (!selectedIndex) {
+      setEditor({ mode: 'edit', item, format: 'dynamodb' })
+      return
+    }
+    const id = ++editRequestId.current
+    setOpeningItem(item)
+    try {
+      const completeItem = await fetchDynamoDBItem(
+        detail.name, extractKeyDynamo(item, detail.partition_key ?? '', detail.sort_key), activeEndpoint,
+      )
+      if (id === editRequestId.current) setEditor({ mode: 'edit', item: completeItem, format: 'dynamodb' })
+    } catch (error) {
+      if (id === editRequestId.current) toast.error(`Failed to open item: ${error}`)
+    } finally {
+      if (id === editRequestId.current) setOpeningItem(null)
+    }
   }
 
   useEffect(() => {
     setSelected([])
   }, [pages, currentPageIndex, loading])
 
+  useEffect(() => () => { editRequestId.current += 1 }, [detail.name, activeEndpoint])
+
+  useEffect(() => {
+    if (indexName && !selectedIndex) selectIndex('')
+  }, [indexName, selectedIndex, selectIndex])
+
   const allColumns = useMemo(() => {
     const keys = new Set<string>()
     if (detail.partition_key) keys.add(detail.partition_key)
     if (detail.sort_key) keys.add(detail.sort_key)
+    if (readPartitionKey) keys.add(readPartitionKey)
+    if (readSortKey) keys.add(readSortKey)
     for (const item of items) for (const k of Object.keys(item)) keys.add(k)
     return [...keys]
-  }, [items, detail])
+  }, [items, detail, readPartitionKey, readSortKey])
   const columns = useMemo(() => allColumns.slice(0, 8), [allColumns])
 
   const deleteSelected = async () => {
@@ -258,6 +306,22 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
   return (
     <SpaceBetween size="m">
       <SpaceBetween direction="horizontal" size="s">
+        {detail.global_secondary_indexes.length > 0 && (
+          <Select
+            ariaLabel="Table or index"
+            selectedOption={{ value: indexName, label: selectedIndex ? `GSI: ${selectedIndex.IndexName}` : `Table: ${detail.name}` }}
+            options={[
+              { value: '', label: `Table: ${detail.name}` },
+              ...detail.global_secondary_indexes.map((index) => ({
+                value: index.IndexName,
+                label: `GSI: ${index.IndexName}`,
+                description: index.IndexStatus,
+              })),
+            ]}
+            disabled={!!openingItem}
+            onChange={({ detail: d }) => selectIndex(d.selectedOption.value ?? '')}
+          />
+        )}
         <SegmentedControl
           selectedId={mode}
           onChange={({ detail: d }) => setMode(d.selectedId as 'scan' | 'query')}
@@ -275,12 +339,20 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
         />
       </SpaceBetween>
 
+      {selectedIndex && (
+        <Box color="text-body-secondary" fontSize="body-s">
+          Index keys: {readPartitionKey} ({detail.attribute_definitions[readPartitionKey ?? ''] ?? 'S'})
+          {readSortKey ? `, ${readSortKey} (${detail.attribute_definitions[readSortKey] ?? 'S'})` : ''}.
+          {' '}Projection: {selectedIndex.Projection?.ProjectionType ?? 'unknown'}. Filters search projected attributes.
+        </Box>
+      )}
+
       {mode === 'query' && (
         <SpaceBetween direction="horizontal" size="s">
-          <FormField label={`Partition key (${detail.partition_key ?? 'pk'})`}>
+          <FormField label={`Partition key (${readPartitionKey ?? 'pk'})`}>
             <Input value={queryPk} onChange={({ detail: d }) => setQueryPk(d.value)} />
           </FormField>
-          {detail.sort_key && (
+          {readSortKey && (
             <>
               <FormField label="Operator">
                 <Select
@@ -289,7 +361,7 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
                   options={SORT_OPERATORS}
                 />
               </FormField>
-              <FormField label={`Sort key (${detail.sort_key})`}>
+              <FormField label={`Sort key (${readSortKey})`}>
                 <Input value={querySk} onChange={({ detail: d }) => setQuerySk(d.value)} />
               </FormField>
             </>
@@ -360,7 +432,9 @@ function ItemsPanel({ detail }: { detail: DynamoDBTableDetail }) {
                 wrapText={false}
                 className="max-w-full truncate"
                 ariaLabel={`Edit item with ${key}: ${value}`}
-                onClick={() => setEditor({ mode: 'edit', item: item as Record<string, unknown>, format: 'dynamodb' })}
+                loading={openingItem === item}
+                disabled={!!openingItem}
+                onClick={() => { void editItem(item) }}
               >
                 {value}
               </Button>
