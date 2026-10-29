@@ -528,9 +528,11 @@ export async function fetchDynamoDBItems(
   limit = 25,
   nextToken?: string | null,
   endpoint?: string | null,
+  indexName?: string | null,
 ): Promise<DynamoDBScanResponse> {
   const params = new URLSearchParams({ limit: String(limit) })
   if (nextToken) params.set('exclusive_start_key', nextToken)
+  if (indexName) params.set('index_name', indexName)
   return fetchJSON<DynamoDBScanResponse>(buildUrl(`/dynamodb/tables/${encodeURIComponent(name)}/items`, endpoint, params))
 }
 
@@ -543,6 +545,14 @@ export async function queryDynamoDBTable(name: string, request: DynamoDBQueryReq
   })
   if (!res.ok) throw new Error(`${res.status}: ${res.statusText}`)
   return res.json()
+}
+
+export async function fetchDynamoDBItem(name: string, key: DynamoDBItem, endpoint?: string | null): Promise<DynamoDBItem> {
+  const params = new URLSearchParams({ key: JSON.stringify(key) })
+  const res = await fetch(buildUrl(`/dynamodb/tables/${encodeURIComponent(name)}/item`, endpoint, params))
+  if (!res.ok) return parseDynamoDBErrorResponse(res, `Failed to read item: ${res.status}`)
+  const data = await res.json() as { item: DynamoDBItem }
+  return data.item
 }
 
 async function parseDynamoDBErrorResponse(res: Response, fallback: string): Promise<never> {

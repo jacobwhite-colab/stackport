@@ -186,6 +186,7 @@ class TestQueryTable:
         assert data["table"] == "users"
         assert data["count"] == 1
         assert data["items"][0]["pk"]["S"] == "user1"
+        assert data["next_token"] is None
 
     @patch("backend.routes.dynamodb.get_client")
     def test_query_with_sort_key(self, mock_get_client):
@@ -425,6 +426,43 @@ def _hash_table(mock_ddb, key_type="S"):
 
 
 class TestBinaryAttributes:
+    @patch("backend.routes.dynamodb.get_client")
+    def test_query_paginates_with_binary_and_numeric_keys(self, mock_get_client):
+        mock_ddb = MagicMock()
+        mock_get_client.return_value = mock_ddb
+        mock_ddb.describe_table.return_value = {
+            "Table": {
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "B"}, {"AttributeName": "sk", "AttributeType": "N"}],
+            }
+        }
+        last_key = {"pk": {"B": RAW}, "sk": {"N": "9007199254740993"}}
+        mock_ddb.query.side_effect = [
+            {"Items": [last_key], "ScannedCount": 1, "LastEvaluatedKey": last_key},
+            {"Items": [], "ScannedCount": 0},
+        ]
+        request = {"partition_key_value": RAW_B64, "sort_key_value": "10", "sort_key_operator": ">", "limit": 1}
+        first = client.post("/api/dynamodb/tables/t1/query", json=request)
+        assert first.status_code == 200
+        assert first.json()["next_token"]
+        assert "ExclusiveStartKey" not in mock_ddb.query.call_args.kwargs
+        second = client.post("/api/dynamodb/tables/t1/query", json={**request, "exclusive_start_key": first.json()["next_token"]})
+        assert second.status_code == 200
+        assert second.json()["next_token"] is None
+        assert mock_ddb.query.call_args.kwargs["ExclusiveStartKey"] == last_key
+        assert mock_ddb.query.call_args.kwargs["ExpressionAttributeValues"] == {":pk": {"B": RAW}, ":sk": {"N": "10"}}
+        assert mock_ddb.query.call_args.kwargs["Limit"] == 1
+
+    @patch("backend.routes.dynamodb.get_client")
+    def test_query_rejects_invalid_pagination_token(self, mock_get_client):
+        mock_ddb = MagicMock()
+        mock_get_client.return_value = mock_ddb
+        _hash_table(mock_ddb)
+        resp = client.post("/api/dynamodb/tables/t1/query", json={"partition_key_value": "a", "exclusive_start_key": "invalid!"})
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "Invalid pagination token"
+        mock_ddb.query.assert_not_called()
+
     @patch("backend.routes.dynamodb.get_client")
     def test_scan_returns_binary_as_base64(self, mock_get_client):
         mock_ddb = MagicMock()

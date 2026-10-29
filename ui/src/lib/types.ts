@@ -136,6 +136,13 @@ export interface DynamoDBTable {
   created: string | null
 }
 
+export interface DynamoDBSecondaryIndex {
+  IndexName: string
+  KeySchema: Array<{ AttributeName: string; KeyType: string }>
+  IndexStatus?: string
+  Projection?: { ProjectionType: string; NonKeyAttributes?: string[] }
+}
+
 export interface DynamoDBTableDetail {
   name: string
   status: string
@@ -149,8 +156,8 @@ export interface DynamoDBTableDetail {
   created: string | null
   attribute_definitions: Record<string, string>
   key_schema: Array<{ AttributeName: string; KeyType: string }>
-  global_secondary_indexes: unknown[]
-  local_secondary_indexes: unknown[]
+  global_secondary_indexes: DynamoDBSecondaryIndex[]
+  local_secondary_indexes: DynamoDBSecondaryIndex[]
 }
 
 export interface DynamoDBItem {
@@ -163,6 +170,7 @@ export interface DynamoDBScanResponse {
   count: number
   scanned_count: number
   next_token: string | null
+  reset_pagination?: boolean
 }
 
 export interface DynamoDBQueryRequest {
@@ -170,6 +178,8 @@ export interface DynamoDBQueryRequest {
   sort_key_value?: string | null
   sort_key_operator?: string
   limit?: number
+  exclusive_start_key?: string | null
+  index_name?: string | null
 }
 
 export interface DynamoDBQueryResponse {
@@ -177,6 +187,7 @@ export interface DynamoDBQueryResponse {
   items: DynamoDBItem[]
   count: number
   scanned_count: number
+  next_token: string | null
 }
 
 export type DynamoDBItemFormat = 'dynamodb' | 'plain'
