@@ -170,6 +170,7 @@ export interface DynamoDBScanResponse {
   count: number
   scanned_count: number
   next_token: string | null
+  reset_pagination?: boolean
 }
 
 export interface DynamoDBQueryRequest {

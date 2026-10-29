@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from backend.aws_client import get_client
 from backend.cache import cache
+from backend.dynamodb_scan import scan_items
 from backend.routes.common import EndpointInfo, get_endpoint_info
 from backend.schemas.dynamodb import (
     BatchWriteRequest,
@@ -283,36 +284,41 @@ def scan_table(
 ):
     dynamodb = get_client("dynamodb", **ep.client_kwargs())
 
-    scan_params: dict[str, Any] = {
-        "TableName": name,
-        "Limit": limit,
-    }
-    if index_name:
-        scan_params["IndexName"] = index_name
-
+    start_key = None
+    compatibility = False
     if exclusive_start_key:
         try:
-            decoded = base64.b64decode(exclusive_start_key).decode("utf-8")
-            scan_params["ExclusiveStartKey"] = _item_from_json(json.loads(decoded))
-        except Exception:
-            logger.debug("Invalid exclusive_start_key", exc_info=True)
+            decoded = json.loads(base64.b64decode(exclusive_start_key, validate=True).decode("utf-8"))
+            if not isinstance(decoded, dict) or not decoded:
+                raise ValueError("Missing pagination key")
+            compatibility = decoded.get("_stackport_index_scan") == 1
+            if compatibility:
+                if not index_name or decoded.get("table") != name or decoded.get("index") != index_name:
+                    raise ValueError("Pagination token belongs to another table or index")
+                decoded = decoded["key"]
+            start_key = _item_from_json(decoded)
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="Invalid scan pagination token") from error
 
     try:
-        resp = dynamodb.scan(**scan_params)
-        items = resp.get("Items", [])
-
-        last_evaluated_key = resp.get("LastEvaluatedKey")
+        page = scan_items(dynamodb, name, limit, index_name, start_key, compatibility, allow_compatibility=ep.url is not None)
+        last_evaluated_key = page.next_key
         next_token = None
         if last_evaluated_key:
+            if page.compatibility:
+                last_evaluated_key = {"_stackport_index_scan": 1, "table": name, "index": index_name, "key": last_evaluated_key}
             next_token = base64.b64encode(json.dumps(_to_json_safe(last_evaluated_key)).encode("utf-8")).decode("utf-8")
 
         return {
             "table": name,
-            "items": _to_json_safe(items),
-            "count": len(items),
-            "scanned_count": resp.get("ScannedCount", len(items)),
+            "items": _to_json_safe(page.items),
+            "count": len(page.items),
+            "scanned_count": page.scanned_count,
             "next_token": next_token,
+            "reset_pagination": page.restarted,
         }
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except Exception as e:
         logger.error("Failed to scan table %s: %s", name, e, exc_info=True)
         return {"error": str(e), "items": [], "count": 0}

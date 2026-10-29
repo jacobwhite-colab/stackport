@@ -38,6 +38,10 @@ export function useDynamoDBItemPages(
         if (!response) {
           const pending = fetchPage(token).then((data) => {
             if ('error' in data) throw new Error(String(data.error))
+            if (data.reset_pagination) {
+              responses.clear()
+              responses.set(null, Promise.resolve({ ...data, reset_pagination: false }))
+            }
             return data
           }).catch((error: unknown) => {
             if (responses.get(token) === pending) responses.delete(token)
@@ -56,34 +60,47 @@ export function useDynamoDBItemPages(
     const id = ++requestId.current
     setLoading(true)
     try {
+      let resetPages = reset
+      let targetPageIndex = pageIndex
       let next: PageCursor | null = cursor
       const items: DynamoDBItem[] = []
       const visited = new Set<string | null>()
       while (next && items.length < pageSize) {
-        const { token, offset }: PageCursor = next
+        const token: string | null = next.token
+        const offset: number = next.offset
         if (visited.has(token)) throw new Error('Pagination token did not advance')
         visited.add(token)
         const data = await cache.read(token)
         if (id !== requestId.current) return
+        if (data.reset_pagination) {
+          if (!resetPages) toast.info('Index scan restarted to recover pagination')
+          items.length = 0
+          visited.clear()
+          resetPages = true
+          targetPageIndex = 1
+        }
+        const responseToken: string | null = data.reset_pagination ? null : token
+        const responseOffset: number = data.reset_pagination ? 0 : offset
         const matches = filterDynamoDBItems(data.items, activeFilters, matchMode, caseSensitive)
-        const end = Math.min(matches.length, offset + pageSize - items.length)
-        items.push(...matches.slice(offset, end))
+        const end = Math.min(matches.length, responseOffset + pageSize - items.length)
+        items.push(...matches.slice(responseOffset, end))
         // A UI page can end partway through the matches in a cached response.
         next = end < matches.length
-          ? { token, offset: end }
+          ? { token: responseToken, offset: end }
           : data.next_token ? { token: data.next_token, offset: 0 } : null
-        if (activeFilters.length === 0) break
+        if (activeFilters.length === 0 && items.length > 0) break
       }
 
-      if (items.length > 0 || activeFilters.length === 0) {
+      if (items.length > 0) {
         const page = { items, nextCursor: next }
-        setPages((previous) => reset ? [page] : [...previous, page])
-        setCurrentPageIndex(pageIndex)
+        setPages((previous) => resetPages ? [page] : [...previous, page])
+        setCurrentPageIndex(targetPageIndex)
         return
       }
 
       // Exhausting an empty tail closes Next without creating a blank UI page.
-      setPages((previous) => reset ? [] : previous.map((page, index) =>
+      if (resetPages) setCurrentPageIndex(1)
+      setPages((previous) => resetPages ? [] : previous.map((page, index) =>
         index === previous.length - 1 ? { ...page, nextCursor: null } : page,
       ))
     } catch (error) {

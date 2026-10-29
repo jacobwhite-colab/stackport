@@ -182,6 +182,13 @@ function renderDynamo(path = '/resources/dynamodb') {
   )
 }
 
+function itemReadCalls() {
+  return fetchMock.mock.calls.filter(([url, init]) => {
+    const path = new URL(String(url), 'http://localhost').pathname
+    return path.endsWith('/query') || (path.endsWith('/items') && (!init?.method || init.method === 'GET'))
+  })
+}
+
 function fillFilter(index: number, column: string, value: string) {
   fireEvent.change(screen.getByLabelText(`Filter ${index} column`), { target: { value: column } })
   fireEvent.change(screen.getByRole('textbox', { name: `Filter ${index} search text` }), { target: { value } })
@@ -222,6 +229,55 @@ beforeEach(() => {
 })
 
 describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
+  it('replaces cached index pages when an emulator scan restarts with compatible pagination', async () => {
+    mockIndexReads()
+    const originalFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).includes('exclusive_start_key=index-next')) return Promise.resolve({
+        ok: true, json: () => Promise.resolve({ ...scanPayload, items: indexItems, reset_pagination: true }),
+      } as Response)
+      return originalFetch(input, init)
+    })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    chooseIndex('by-status')
+    await screen.findByText('10')
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText('20')
+    expect(renderedItemKeys()).toEqual(['1', '2'])
+    expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+    const callsBefore = itemReadCalls().length
+    runFilters()
+    await screen.findByText('20')
+    expect(renderedItemKeys()).toEqual(['1', '2'])
+    expect(itemReadCalls()).toHaveLength(callsBefore)
+  })
+
+  it.each(['middle', 'tail'] as const)('skips an empty index scan %s without displaying a blank page', async (emptyPage) => {
+    mockIndexReads()
+    const originalFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).includes('exclusive_start_key=index-next')) return Promise.resolve({
+        ok: true, json: () => Promise.resolve({ ...scanPayload, items: [], next_token: emptyPage === 'middle' ? 'after-empty' : null }),
+      } as Response)
+      if (String(input).includes('exclusive_start_key=after-empty')) return Promise.resolve({
+        ok: true, json: () => Promise.resolve({ ...scanPayload, items: [indexItems[1]] }),
+      } as Response)
+      return originalFetch(input, init)
+    })
+    renderDynamo('/resources/dynamodb?table=learners')
+    await screen.findByText('Ada')
+    chooseIndex('by-status')
+    await screen.findByText('10')
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
+    await screen.findByText(emptyPage === 'middle' ? '20' : '10')
+    expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('button', { name: emptyPage === 'middle' ? 'Page 2' : 'Page 1' })).toHaveAttribute('aria-current', 'true')
+    expect(screen.queryByRole('button', { name: 'Page 3' })).not.toBeInTheDocument()
+    if (emptyPage === 'tail') expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
+  })
+
   it('scans a selected GSI, preserves its cursor, and resets pagination when returning to the table', async () => {
     mockIndexReads()
     renderDynamo('/resources/dynamodb?table=learners')
@@ -237,10 +293,10 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(params.get('index_name')).toBe('by-status')
     expect(params.get('exclusive_start_key')).toBe('index-next')
     expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
-    const callsBefore = fetchMock.mock.calls.length
+    const callsBefore = itemReadCalls().length
     fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
     expect(screen.getByText('10')).toBeInTheDocument()
-    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    expect(itemReadCalls()).toHaveLength(callsBefore)
     chooseIndex('')
     await screen.findByText('Ada')
     const tableParams = new URL(String(scanCalls().at(-1)![0]), 'http://localhost').searchParams
@@ -486,9 +542,9 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(await screen.findByRole('link', { name: 'learners' }))
     await screen.findByText('Ada')
 
-    const checkboxes = screen.getAllByRole('checkbox')
-    fireEvent.click(checkboxes[0]) // select all
-    fireEvent.click(screen.getByText(/Delete selected \(2\)/))
+    const itemTable = screen.getByText('Ada').closest('table')!
+    fireEvent.click(within(itemTable).getAllByRole('checkbox')[0])
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete selected (2)' }))
 
     await waitFor(() => {
       const batchCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/items/batch'))
@@ -513,14 +569,14 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     }
     const grace = screen.getByText('Grace').closest('tr')!
     fireEvent.click(within(grace).getByRole('checkbox'))
-    const callsBefore = fetchMock.mock.calls.length
+    const callsBefore = itemReadCalls().length
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)) })
     expect(screen.getByText('Grace')).toBeInTheDocument()
     expect(screen.queryByText('Ada')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Delete selected (1)' })).toBeEnabled()
-    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    expect(itemReadCalls()).toHaveLength(callsBefore)
     runFilters()
     await screen.findByText('Ada')
     expect(screen.queryByText('Grace')).not.toBeInTheDocument()
@@ -538,7 +594,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
   it('adds, combines, removes, and clears optional text filters on Run without refetching', async () => {
     renderDynamo('/resources/dynamodb?table=learners')
     await screen.findByText('Ada')
-    const callsBefore = fetchMock.mock.calls.length
+    const callsBefore = itemReadCalls().length
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     expect(screen.getByText('Grace')).toBeInTheDocument()
     fillFilter(1, 'name', 'ADA')
@@ -570,7 +626,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
     runFilters()
     await screen.findByText('Grace')
-    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    expect(itemReadCalls()).toHaveLength(callsBefore)
   })
 
   it('clears previous selections and bulk-deletes only selected filtered rows', async () => {
@@ -634,16 +690,14 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     })
   })
 
-  it.each(['scan', 'query'] as const)('combines 58 and 31 filtered %s matches into one page at a target of 100', async (mode) => {
-    const first = makeItems('first', 58)
-    const second = makeItems('second', 31)
+  it.each(['scan', 'query'] as const)('combines partially matching %s responses into one UI page', async (mode) => {
+    const first = makeItems('first', 8)
+    const second = makeItems('second', 5)
     mockItemPages([
-      [...first, ...makeItems('skipped-first', 42, 'Grace')],
-      [...second, ...makeItems('skipped-second', 69, 'Grace')],
+      [...first, ...makeItems('skipped-first', 17, 'Grace')],
+      [...second, ...makeItems('skipped-second', 20, 'Grace')],
     ])
     renderDynamo('/resources/dynamodb?table=learners')
-    await screen.findByRole('button', { name: 'Edit item with id: first-1' })
-    choosePageSize('100')
     await screen.findByRole('button', { name: 'Edit item with id: first-1' })
     if (mode === 'query') {
       fireEvent.click(screen.getByText('Query'))
@@ -654,24 +708,22 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
     runFilters()
-    await screen.findByText('(89 matching)', {}, { timeout: 3000 })
+    await screen.findByText('(13 matching)', {}, { timeout: 3000 })
     expect(renderedItemKeys()).toEqual([...first, ...second].map((item) => (item.id as { S: string }).S))
     expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
     expect(screen.queryByRole('button', { name: 'Page 2' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
   })
 
-  it.each(['scan', 'query'] as const)('fills %s pages to 100 and preserves overflow from the final response', async (mode) => {
-    const first = makeItems('first', 58)
-    const second = makeItems('second', 67)
+  it.each(['scan', 'query'] as const)('fills %s pages to the selected size and preserves overflow from the final response', async (mode) => {
+    const first = makeItems('first', 14)
+    const second = makeItems('second', 17)
     mockItemPages([
-      [...first, ...makeItems('skipped-first', 42, 'Grace')],
+      [...first, ...makeItems('skipped-first', 11, 'Grace')],
       [],
-      [...second, ...makeItems('skipped-second', 33, 'Grace')],
+      [...second, ...makeItems('skipped-second', 8, 'Grace')],
     ])
     renderDynamo('/resources/dynamodb?table=learners')
-    await screen.findByRole('button', { name: 'Edit item with id: first-1' })
-    choosePageSize('100')
     await screen.findByRole('button', { name: 'Edit item with id: first-1' })
     if (mode === 'query') {
       fireEvent.click(screen.getByText('Query'))
@@ -682,24 +734,24 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add filter' }))
     fillFilter(1, 'name', 'Ada')
     runFilters()
-    await screen.findByText('(100 matching)', {}, { timeout: 3000 })
+    await screen.findByText('(25 matching)', {}, { timeout: 3000 })
     const expectedKeys = [...first, ...second].map((item) => (item.id as { S: string }).S)
-    expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 100))
-    const callsBefore = fetchMock.mock.calls.length
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 25))
+    const callsBefore = itemReadCalls().length
     fillFilter(1, 'name', 'Grace')
     fireEvent.click(within(screen.getByRole('button', { name: 'Edit item with id: first-1' }).closest('tr')!).getByRole('checkbox'))
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
-    await screen.findByText('(25 matching)')
-    expect(renderedItemKeys()).toEqual(expectedKeys.slice(100))
+    await screen.findByText('(6 matching)')
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(25))
     expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
     expect(screen.getByRole('button', { name: 'Page 2' })).toHaveAttribute('aria-current', 'true')
     expect(screen.queryByRole('button', { name: 'Page 3' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
-    expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 100))
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(0, 25))
     fireEvent.click(screen.getByRole('button', { name: 'Page 2' }))
-    expect(renderedItemKeys()).toEqual(expectedKeys.slice(100))
-    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    expect(renderedItemKeys()).toEqual(expectedKeys.slice(25))
+    expect(itemReadCalls()).toHaveLength(callsBefore)
   }, 15000)
 
   it('restarts on page 1 when Run filters is clicked again with unchanged criteria', async () => {
@@ -712,13 +764,13 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     await screen.findByText('(25 matching)')
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
     await screen.findByText('(1 matching)')
-    const callsBefore = fetchMock.mock.calls.length
+    const callsBefore = itemReadCalls().length
     runFilters()
     await screen.findByText('(25 matching)')
     expect(screen.getByRole('button', { name: 'Page 1' })).toHaveAttribute('aria-current', 'true')
     expect(screen.getByRole('button', { name: 'Edit item with id: first-25' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Edit item with id: second-1' })).not.toBeInTheDocument()
-    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    expect(itemReadCalls()).toHaveLength(callsBefore)
   })
 
   it.each(['scan', 'query'] as const)('stops %s at the end when no items match and hides pagination', async (mode) => {
@@ -748,7 +800,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     fillFilter(1, 'name', 'Ada')
     runFilters()
     await screen.findByText('Ada')
-    const callsBefore = fetchMock.mock.calls.length
+    const callsBefore = itemReadCalls().length
     fillFilter(1, 'name', 'Grace')
     runFilters()
     await screen.findByText('Grace')
@@ -759,7 +811,7 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     await screen.findByText('Grace')
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }))
     await screen.findByText('Ada')
-    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    expect(itemReadCalls()).toHaveLength(callsBefore)
   })
 
   it('abandons an obsolete filter search when filters are cleared without fetching further pages', async () => {
@@ -818,13 +870,13 @@ describe('CloudscapeDynamoDBBrowser (via registry dispatch)', () => {
     expect(screen.getByRole('button', { name: 'Delete selected (0)' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Page 2' })).toHaveAttribute('aria-current', 'true')
     expect(screen.getByRole('button', { name: 'Next page' })).toHaveAttribute('aria-disabled', 'true')
-    const callsBefore = fetchMock.mock.calls.length
+    const callsBefore = itemReadCalls().length
     fireEvent.click(screen.getByRole('button', { name: 'Previous page' }))
     expect(screen.getByText('Ada')).toBeInTheDocument()
     expect(screen.queryByText('Grace')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Page 2' }))
     expect(screen.getByText('Grace')).toBeInTheDocument()
-    expect(fetchMock.mock.calls).toHaveLength(callsBefore)
+    expect(itemReadCalls()).toHaveLength(callsBefore)
   })
 
   it.each(['scan', 'query'] as const)('restarts %s pagination when the page size changes or items are refreshed', async (mode) => {
